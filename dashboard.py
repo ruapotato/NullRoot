@@ -86,6 +86,7 @@ HTML = """<!DOCTYPE html>
   .fail { color: #f85149; }
 </style>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation@3"></script>
 </head>
 <body>
 
@@ -129,13 +130,21 @@ HTML = """<!DOCTYPE html>
 </div>
 
 <script>
+const STAGE_NAMES = [
+  'mkdir+cd+ls', '+pwd', '+touch', '+echo>', '+cat', '+echo>>', '+rm', '+errors'
+];
+const STAGE_COLORS = [
+  '#f85149', '#d29922', '#3fb950', '#58a6ff', '#bc8cff', '#f778ba', '#79c0ff', '#ffa657'
+];
+const GATE_THRESHOLD = 1.5;
+
 const chartOpts = (label, color) => ({
   type: 'line',
   data: { labels: [], datasets: [{ label, data: [], borderColor: color, backgroundColor: color + '22', fill: true, pointRadius: 0, borderWidth: 1.5, tension: 0.3 }] },
   options: {
     responsive: true, animation: false,
     scales: { x: { ticks: { color: '#8b949e', maxTicksLimit: 8 }, grid: { color: '#21262d' } }, y: { ticks: { color: '#8b949e' }, grid: { color: '#21262d' } } },
-    plugins: { legend: { display: false } }
+    plugins: { legend: { display: false }, annotation: { annotations: {} } }
   }
 });
 
@@ -143,16 +152,44 @@ const lossChart = new Chart(document.getElementById('lossChart'), chartOpts('Los
 const pplChart  = new Chart(document.getElementById('pplChart'),  chartOpts('PPL',  '#d29922'));
 const lrChart   = new Chart(document.getElementById('lrChart'),   chartOpts('LR',   '#3fb950'));
 const speedChart= new Chart(document.getElementById('speedChart'),chartOpts('tok/s','#58a6ff'));
+const allCharts = [lossChart, pplChart, lrChart, speedChart];
 
-const STAGE_NAMES = [
-  'mkdir+cd+ls', '+pwd', '+touch', '+echo>', '+cat', '+echo>>', '+rm', '+errors'
-];
-const GATE_THRESHOLD = 1.5;
+function buildStageAnnotations(stages) {
+  // Build vertical line annotations for each stage transition
+  const annotations = {};
+  stages.forEach((s, i) => {
+    if (i === 0) return; // skip first stage, it starts at 0
+    annotations['stage' + i] = {
+      type: 'line',
+      xMin: s.global_step,
+      xMax: s.global_step,
+      borderColor: STAGE_COLORS[s.stage % STAGE_COLORS.length] + 'aa',
+      borderWidth: 2,
+      borderDash: [6, 4],
+      label: {
+        display: true,
+        content: 'S' + s.stage,
+        position: 'start',
+        backgroundColor: STAGE_COLORS[s.stage % STAGE_COLORS.length] + '44',
+        color: STAGE_COLORS[s.stage % STAGE_COLORS.length],
+        font: { size: 10, family: 'monospace' },
+        padding: 3
+      }
+    };
+  });
+  return annotations;
+}
 
 function update(data) {
   const t = data.train;
   const gates = data.gates || [];
   const stages = data.stages || [];
+
+  // Update stage annotations on all charts
+  const annotations = buildStageAnnotations(stages);
+  allCharts.forEach(chart => {
+    chart.options.plugins.annotation.annotations = annotations;
+  });
 
   // Stage pipeline
   const currentStage = t.length ? t[t.length-1].stage : (stages.length ? stages[stages.length-1].stage : 0);
