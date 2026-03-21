@@ -24,18 +24,15 @@ def _build_labels(ids: list[int], tokenizer: BashTokenizer) -> list[int]:
     Masking strategy:
     - <prompt> token and everything after it until the newline: masked (-100)
       (this is the user's command — we don't predict it)
-    - <output> token: masked (-100) (it's a structural marker)
+    - <output> token: TRAINED (model must learn to decide success vs error)
     - Content after <output> until next <prompt> or <eos>: TRAINED
-    - <err> token: TRAINED (model should learn to predict errors)
+    - <err> token: TRAINED (model must learn to predict errors)
     - Content after <err> until next <prompt> or <eos>: TRAINED
-    - <eos> token: TRAINED (model should learn to emit it)
+    - <eos> token: TRAINED (model must learn to emit it)
     - <pad> token: masked (-100)
     """
     prompt_id = tokenizer.prompt_id
-    output_id = tokenizer.output_id
-    err_id = tokenizer.err_id
     pad_id = tokenizer.pad_id
-    eos_id = tokenizer.eos_id
     newline_id = tokenizer.newline_id
 
     labels = list(ids)
@@ -51,12 +48,9 @@ def _build_labels(ids: list[int], tokenizer: BashTokenizer) -> list[int]:
             labels[i] = -100
             if tok_id == newline_id:
                 in_prompt = False
-        elif tok_id == output_id:
-            # Mask the <output> structural token itself, but train on its content
-            labels[i] = -100
         elif tok_id == pad_id:
             labels[i] = -100
-        # <err>, <eos>, and all output content: keep as-is (trained)
+        # <output>, <err>, <eos>, and all output content: keep as-is (trained)
 
     return labels
 

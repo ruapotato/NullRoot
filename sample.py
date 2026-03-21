@@ -23,7 +23,10 @@ def load_model(ckpt_path: str, device: torch.device) -> BashTransformer:
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     config = ckpt.get("config", BashTransformerConfig())
     model = BashTransformer(config).to(device).to(torch.bfloat16)
-    model.load_state_dict(ckpt["model_state_dict"])
+    # Strip _orig_mod. prefix from torch.compile'd checkpoints
+    state_dict = ckpt["model_state_dict"]
+    state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
+    model.load_state_dict(state_dict)
     model.eval()
     step = ckpt.get("step", "?")
     print(f"Loaded checkpoint from step {step}")

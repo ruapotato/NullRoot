@@ -78,6 +78,12 @@ STAGES = [
         "commands": {"mkdir", "cd_child", "cd_up", "cd_abs", "ls", "pwd", "touch", "echo_write", "cat", "echo_append", "rm", "errors"},
         "error_rate": 0.05,
     },
+    {
+        "name": "Stage 9: anneal (all commands)",
+        "commands": {"mkdir", "cd_child", "cd_up", "cd_abs", "ls", "pwd", "touch", "echo_write", "cat", "echo_append", "rm", "errors"},
+        "error_rate": 0.05,
+        "anneal": True,  # signals special LR treatment
+    },
 ]
 
 
@@ -196,11 +202,14 @@ class CurriculumConfig:
     seq_len: int = 65536
     grad_accum: int = 4
     steps_per_stage: int = 2000       # max steps before forced gate check
+    anneal_steps: int = 5000          # longer for final annealing stage
     gate_threshold: float = 1.5       # val loss must be below this to advance
     gate_check_every: int = 100       # check gate this often
     warmup_steps: int = 100           # per stage
     max_lr: float = 3e-4
     min_lr: float = 3e-5
+    anneal_max_lr: float = 5e-5      # low starting LR for annealing
+    anneal_min_lr: float = 1e-6      # decays to near zero
     max_grad_norm: float = 1.0
     log_every: int = 10
     data_workers: int = 4
@@ -288,10 +297,19 @@ def train_curriculum(cfg: CurriculumConfig):
         step_t0 = time.time()
         passed_gate = False
 
-        while stage_step < cfg.steps_per_stage:
+        # Anneal stage: more steps, lower LR
+        is_anneal = stage.get("anneal", False)
+        stage_max_steps = cfg.anneal_steps if is_anneal else cfg.steps_per_stage
+        stage_max_lr = cfg.anneal_max_lr if is_anneal else cfg.max_lr
+        stage_min_lr = cfg.anneal_min_lr if is_anneal else cfg.min_lr
+
+        if is_anneal:
+            print(f"  Annealing: {stage_max_steps} steps, LR {stage_max_lr} -> {stage_min_lr}")
+
+        while stage_step < stage_max_steps:
             # LR schedule (per-stage cosine)
-            lr = get_lr(stage_step, cfg.warmup_steps, cfg.steps_per_stage,
-                        cfg.max_lr, cfg.min_lr)
+            lr = get_lr(stage_step, cfg.warmup_steps, stage_max_steps,
+                        stage_max_lr, stage_min_lr)
             for pg in optimizer.param_groups:
                 pg["lr"] = lr
 
@@ -344,8 +362,8 @@ def train_curriculum(cfg: CurriculumConfig):
                 }
                 log(entry)
 
-                eta_stage = (cfg.steps_per_stage - stage_step) / max(steps_per_sec, 0.001)
-                print(f"  S{stage_idx} {stage_step:>5d}/{cfg.steps_per_stage} "
+                eta_stage = (stage_max_steps - stage_step) / max(steps_per_sec, 0.001)
+                print(f"  S{stage_idx} {stage_step:>5d}/{stage_max_steps} "
                       f"(g:{global_step}) | loss {avg_running:.4f} | ppl {ppl:>7.2f} | "
                       f"lr {lr:.2e} | {steps_per_sec:.2f} s/s | {tokens_per_sec:,.0f} t/s | "
                       f"gpu {mem_peak:.1f}GB | eta {eta_stage/60:.0f}m")
@@ -364,7 +382,22 @@ def train_curriculum(cfg: CurriculumConfig):
                       f"val_ppl={val_metrics['val_ppl']:.2f}  "
                       f"threshold={cfg.gate_threshold}")
 
-                if val_metrics["val_loss"] < cfg.gate_threshold:
+                if is_anneal:
+                    # Anneal stage: no gate, just log progress and keep going
+                    # Save periodic checkpoints
+                    if stage_step % 1000 == 0:
+                        ckpt_path = str(ckpt_dir / f"anneal_step{global_step}.pt")
+                        torch.save({
+                            "global_step": global_step,
+                            "stage": stage_idx,
+                            "model_state_dict": model.state_dict(),
+                            "optimizer_state_dict": optimizer.state_dict(),
+                            "val_metrics": val_metrics,
+                            "config": model_config,
+                        }, ckpt_path)
+                        print(f"  Saved: {ckpt_path}")
+                    print()
+                elif val_metrics["val_loss"] < cfg.gate_threshold:
                     print(f"  GATE PASSED - advancing to next stage")
                     passed_gate = True
 
