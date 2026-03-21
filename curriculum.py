@@ -157,7 +157,24 @@ class StageValidationDataset(torch.utils.data.Dataset):
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def evaluate(model, val_dataset, device):
+def generate_response(model, prompt_ids: list[int], tokenizer: BashTokenizer,
+                      device, max_tokens: int = 512) -> list[int]:
+    """Generate tokens from the model until <prompt>, <eos>, or max length."""
+    ids = list(prompt_ids)
+    for _ in range(max_tokens):
+        input_t = torch.tensor([ids], dtype=torch.long, device=device)
+        with autocast("cuda", dtype=torch.bfloat16):
+            out = model(input_t)
+        next_id = out["logits"][0, -1, :].argmax().item()
+        ids.append(next_id)
+        if next_id in (tokenizer.prompt_id, tokenizer.eos_id):
+            break
+    return ids[len(prompt_ids):]
+
+
+@torch.no_grad()
+def evaluate(model, val_dataset, device, tokenizer=None, num_samples=5, log_fn=None):
+    """Run validation and optionally generate sample outputs."""
     model.eval()
     total_loss = 0.0
     total_tokens = 0
@@ -176,8 +193,73 @@ def evaluate(model, val_dataset, device):
 
     avg_loss = total_loss / max(total_tokens, 1)
     ppl = math.exp(min(avg_loss, 20))
+
+    # Generate sample outputs from scratch to see what the model actually does
+    samples = []
+    if tokenizer and num_samples > 0:
+        # Build a few test prompts from the validation data
+        val_ids = val_dataset.samples[0]  # raw token ids from first session
+        tok = tokenizer
+
+        # Find prompt positions in the validation data
+        prompt_positions = []
+        for j, tid in enumerate(val_ids):
+            if tid == tok.prompt_id:
+                prompt_positions.append(j)
+
+        # Pick evenly spaced prompts to test
+        if len(prompt_positions) >= num_samples:
+            step = len(prompt_positions) // num_samples
+            test_positions = prompt_positions[::step][:num_samples]
+        else:
+            test_positions = prompt_positions[:num_samples]
+
+        for pos in test_positions:
+            # Context = everything up to and including this command's newline
+            ctx_end = pos
+            for k in range(pos + 1, min(pos + 100, len(val_ids))):
+                ctx_end = k
+                if val_ids[k] == tok.newline_id:
+                    ctx_end = k + 1
+                    break
+
+            context = val_ids[:ctx_end]
+            command_text = tok.decode(val_ids[pos:ctx_end])
+
+            # Find expected output (everything from ctx_end until next <prompt> or <eos>)
+            expected_end = ctx_end
+            for k in range(ctx_end, min(ctx_end + 500, len(val_ids))):
+                if val_ids[k] == tok.prompt_id or val_ids[k] == tok.eos_id:
+                    break
+                expected_end = k + 1
+            expected_text = tok.decode(val_ids[ctx_end:expected_end])
+
+            # Generate model response
+            gen_ids = generate_response(model, context, tok, device)
+            gen_text = tok.decode(gen_ids)
+
+            sample = {
+                "command": command_text.strip(),
+                "expected": expected_text.strip(),
+                "generated": gen_text.strip(),
+                "match": expected_text.strip() == gen_text.strip(),
+            }
+            samples.append(sample)
+
+            # Print to console
+            match_str = "OK" if sample["match"] else "WRONG"
+            print(f"    [{match_str}] {sample['command']}")
+            print(f"      expected:  {sample['expected']!r}")
+            print(f"      got:       {sample['generated']!r}")
+
+        # Log samples
+        if log_fn:
+            log_fn({"type": "samples", "samples": samples})
+
     model.train()
-    return {"val_loss": avg_loss, "val_ppl": ppl, "val_tokens": total_tokens}
+    return {"val_loss": avg_loss, "val_ppl": ppl, "val_tokens": total_tokens,
+            "num_correct": sum(1 for s in samples if s["match"]),
+            "num_samples": len(samples)}
 
 
 # ---------------------------------------------------------------------------
@@ -374,7 +456,9 @@ def train_curriculum(cfg: CurriculumConfig):
             # --- Gate check ---
             if stage_step % cfg.gate_check_every == 0:
                 print(f"\n  Gate check at stage step {stage_step}...")
-                val_metrics = evaluate(model, val_ds, device)
+                tok = BashTokenizer()
+                val_metrics = evaluate(model, val_ds, device,
+                                       tokenizer=tok, num_samples=5, log_fn=log)
                 log({"type": "gate_check", "stage": stage_idx,
                      "stage_step": stage_step, "step": global_step,
                      **val_metrics})
