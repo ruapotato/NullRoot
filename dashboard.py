@@ -19,8 +19,9 @@ def read_log():
     evals = []
     gates = []
     stages = []
+    samples = []
     if not os.path.exists(LOG_PATH):
-        return train, evals, gates, stages
+        return train, evals, gates, stages, samples
     with open(LOG_PATH) as f:
         for line in f:
             line = line.strip()
@@ -32,17 +33,19 @@ def read_log():
                 gates.append(entry)
             elif t == "stage_start":
                 stages.append(entry)
+            elif t == "samples":
+                samples.append(entry)
             elif t in ("eval", "final_eval"):
                 evals.append(entry)
             elif "loss" in entry:
                 train.append(entry)
-    return train, evals, gates, stages
+    return train, evals, gates, stages, samples
 
 
 @app.route("/api/data")
 def api_data():
-    train, evals, gates, stages = read_log()
-    return {"train": train, "evals": evals, "gates": gates, "stages": stages}
+    train, evals, gates, stages, samples = read_log()
+    return {"train": train, "evals": evals, "gates": gates, "stages": stages, "samples": samples}
 
 
 @app.route("/")
@@ -84,6 +87,16 @@ HTML = """<!DOCTYPE html>
   .tbl td { padding: 6px 10px; border-bottom: 1px solid #21262d; }
   .pass { color: #3fb950; font-weight: bold; }
   .fail { color: #f85149; }
+
+  .sample { background: #0d1117; border: 1px solid #30363d; border-radius: 6px; padding: 10px; margin-bottom: 8px; font-size: 13px; }
+  .sample .cmd { color: #58a6ff; font-weight: bold; margin-bottom: 4px; }
+  .sample .expected { color: #8b949e; }
+  .sample .got { margin-top: 2px; }
+  .sample .got.ok { color: #3fb950; }
+  .sample .got.wrong { color: #f85149; }
+  .sample .badge { display: inline-block; padding: 1px 6px; border-radius: 3px; font-size: 11px; font-weight: bold; margin-left: 8px; }
+  .sample .badge.ok { background: #3fb95022; color: #3fb950; }
+  .sample .badge.wrong { background: #f8514922; color: #f85149; }
 </style>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
 <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation@3"></script>
@@ -97,6 +110,7 @@ HTML = """<!DOCTYPE html>
   <h2 id="stage-title">Waiting for data...</h2>
   <div id="stage-desc" style="color:#8b949e; font-size:13px;"></div>
   <div class="stage-pipeline" id="stage-pipeline"></div>
+  <div id="stage-defs" style="margin-top:12px; display:grid; grid-template-columns:repeat(4,1fr); gap:6px; font-size:11px;"></div>
 </div>
 
 <div class="stats">
@@ -129,21 +143,40 @@ HTML = """<!DOCTYPE html>
   </div>
 </div>
 
+<div class="grid">
+  <div class="card full">
+    <h2>Sample Outputs (latest gate check)</h2>
+    <div id="samplesContainer" style="color:#8b949e; font-size:13px;">No samples yet</div>
+  </div>
+</div>
+
 <script>
-const STAGE_NAMES = [
-  'mkdir+cd+ls', '+pwd', '+touch', '+echo>', '+cat', '+echo>>', '+rm', '+errors'
+const STAGE_DEFS = [
+  { name: 'S1', label: 'mkdir+cd+ls',  cmds: ['mkdir', 'cd', 'ls'] },
+  { name: 'S2', label: '+pwd',         cmds: ['mkdir', 'cd', 'ls', 'pwd'] },
+  { name: 'S3', label: '+touch',       cmds: ['mkdir', 'cd', 'ls', 'pwd', 'touch'] },
+  { name: 'S4', label: '+echo\u00a0>', cmds: ['mkdir', 'cd', 'ls', 'pwd', 'touch', 'echo\u00a0>'] },
+  { name: 'S5', label: '+cat',         cmds: ['mkdir', 'cd', 'ls', 'pwd', 'touch', 'echo\u00a0>', 'cat'] },
+  { name: 'S6', label: '+echo\u00a0>>', cmds: ['mkdir', 'cd', 'ls', 'pwd', 'touch', 'echo\u00a0>', 'cat', 'echo\u00a0>>'] },
+  { name: 'S7', label: '+rm',          cmds: ['mkdir', 'cd', 'ls', 'pwd', 'touch', 'echo\u00a0>', 'cat', 'echo\u00a0>>', 'rm'] },
+  { name: 'S8', label: '+errors',      cmds: ['mkdir', 'cd', 'ls', 'pwd', 'touch', 'echo\u00a0>', 'cat', 'echo\u00a0>>', 'rm', '<err>'] },
+  { name: 'S9', label: 'anneal',      cmds: ['all commands', 'low LR decay'] },
 ];
+const STAGE_NAMES = STAGE_DEFS.map(s => s.label);
 const STAGE_COLORS = [
-  '#f85149', '#d29922', '#3fb950', '#58a6ff', '#bc8cff', '#f778ba', '#79c0ff', '#ffa657'
+  '#f85149', '#d29922', '#3fb950', '#58a6ff', '#bc8cff', '#f778ba', '#79c0ff', '#ffa657', '#da7b22'
 ];
 const GATE_THRESHOLD = 1.5;
 
 const chartOpts = (label, color) => ({
   type: 'line',
-  data: { labels: [], datasets: [{ label, data: [], borderColor: color, backgroundColor: color + '22', fill: true, pointRadius: 0, borderWidth: 1.5, tension: 0.3 }] },
+  data: { datasets: [{ label, data: [], borderColor: color, backgroundColor: color + '22', fill: true, pointRadius: 0, borderWidth: 1.5, tension: 0.3 }] },
   options: {
     responsive: true, animation: false,
-    scales: { x: { ticks: { color: '#8b949e', maxTicksLimit: 8 }, grid: { color: '#21262d' } }, y: { ticks: { color: '#8b949e' }, grid: { color: '#21262d' } } },
+    scales: {
+      x: { type: 'linear', title: { display: false }, ticks: { color: '#8b949e', maxTicksLimit: 8 }, grid: { color: '#21262d' } },
+      y: { ticks: { color: '#8b949e' }, grid: { color: '#21262d' } }
+    },
     plugins: { legend: { display: false }, annotation: { annotations: {} } }
   }
 });
@@ -208,26 +241,38 @@ function update(data) {
   if (stages.length) {
     const latest = stages[stages.length-1];
     stageTitle.textContent = latest.name || ('Stage ' + latest.stage);
-    stageDesc.textContent = 'Stage ' + (currentStage+1) + '/8 | ' + passedStages.size + ' gates passed';
+    stageDesc.textContent = 'Stage ' + (currentStage+1) + '/9 | ' + passedStages.size + ' gates passed';
   }
+
+  // Stage definitions
+  const defsEl = document.getElementById('stage-defs');
+  defsEl.innerHTML = STAGE_DEFS.map((s, i) => {
+    let border = STAGE_COLORS[i];
+    let opacity = '44';
+    let badge = '';
+    if (passedStages.has(i)) { opacity = 'aa'; badge = ' \u2713'; }
+    else if (i === currentStage) { opacity = 'ff'; badge = ' \u25C0'; }
+    return '<div style="border:1px solid ' + border + opacity + '; border-radius:4px; padding:6px; ' +
+      (i === currentStage ? 'background:' + border + '11;' : '') + '">' +
+      '<div style="color:' + border + '; font-weight:bold; margin-bottom:3px;">' + s.name + badge + '</div>' +
+      '<div style="color:#8b949e;">' + s.cmds.join(' ') + '</div></div>';
+  }).join('');
+
 
   if (!t.length) return;
 
-  const steps = t.map(e => e.step);
-  const losses = t.map(e => e.loss);
-  const ppls = t.map(e => e.ppl);
-  const lrs = t.map(e => e.lr);
-  const speeds = t.map(e => e.tokens_per_sec);
+  function xyData(key) {
+    return t.map(e => ({ x: e.step, y: e[key] }));
+  }
 
-  function setChart(chart, labels, values) {
-    chart.data.labels = labels;
-    chart.data.datasets[0].data = values;
+  function setChart(chart, points) {
+    chart.data.datasets[0].data = points;
     chart.update();
   }
-  setChart(lossChart, steps, losses);
-  setChart(pplChart, steps, ppls);
-  setChart(lrChart, steps, lrs);
-  setChart(speedChart, steps, speeds);
+  setChart(lossChart, xyData('loss'));
+  setChart(pplChart, xyData('ppl'));
+  setChart(lrChart, xyData('lr'));
+  setChart(speedChart, xyData('tokens_per_sec'));
 
   const last = t[t.length - 1];
   document.getElementById('s-step').textContent = last.step.toLocaleString();
@@ -260,6 +305,27 @@ function update(data) {
         '<td class="' + (passed ? 'pass' : 'fail') + '">' + (passed ? 'PASS' : 'FAIL') + '</td>' +
         '<td>' + (g.timestamp||'') + '</td></tr>';
     }).join('');
+  }
+
+  // Sample outputs
+  const samplesEl = document.getElementById('samplesContainer');
+  const allSamples = data.samples || [];
+  if (allSamples.length) {
+    const latest = allSamples[allSamples.length - 1];
+    const items = latest.samples || [];
+    const correct = items.filter(s => s.match).length;
+    samplesEl.innerHTML = '<div style="margin-bottom:8px; color:#c9d1d9;">' +
+      correct + '/' + items.length + ' correct</div>' +
+      items.map(s => {
+        const cls = s.match ? 'ok' : 'wrong';
+        function esc(str) { return (str||'').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+        return '<div class="sample">' +
+          '<div class="cmd">$ ' + esc(s.command) +
+          '<span class="badge ' + cls + '">' + (s.match ? 'MATCH' : 'MISMATCH') + '</span></div>' +
+          '<div class="expected">expected: <code>' + esc(s.expected) + '</code></div>' +
+          '<div class="got ' + cls + '">got: <code>' + esc(s.generated) + '</code></div>' +
+          '</div>';
+      }).join('');
   }
 
   document.getElementById('status').textContent = 'updated ' + new Date().toLocaleTimeString();
