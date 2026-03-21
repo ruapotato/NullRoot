@@ -9,9 +9,42 @@ Can a tiny model learn the *rules* of a filesystem purely from examples? Not pat
 ## Approach
 
 - **No real data.** All training data is generated on the fly by a simulator that tracks full filesystem state. Every session is unique — names are combinatorial gibberish so the model can't memorize them.
-- **Tiny vocab.** 61 hand-defined tokens. No BPE, no subword. Commands, lowercase letters, digits, punctuation, and structural tokens.
+- **Tiny vocab.** 63 hand-defined tokens. No BPE, no subword. Commands, lowercase letters, digits, punctuation, and structural tokens.
+- **Explicit boundaries.** `<eoi>` and `<eor>` tokens separate user input from model output. `\n` is never a structural delimiter — it's purely a content character for multiline file data.
 - **Label masking.** The model only trains on predicting outputs, not commands. It sees the commands in attention (full context) but is only graded on the responses.
+- **Curriculum training.** Commands are introduced in stages (mkdir+cd+ls first, then pwd, touch, echo, cat, etc). Each stage must pass a validation gate before advancing.
 - **Session packing.** Short sessions are packed end-to-end to fill 65K context windows. No wasted padding.
+
+## Tokenization
+
+63 tokens total, all hand-defined. No BPE, no subword merging.
+
+**Transcript format:**
+
+```
+<prompt>mkdir foo<eoi><output><eor><prompt>cat file<eoi><output>hello\nworld<eor><eos>
+|---- user input ---|            |---- user input -----|                          |
+                     |-- model --|                      |-------- model ----------|
+```
+
+**Structural tokens:**
+- `<prompt>` — start of user command
+- `<eoi>` — end of input (command boundary, system-provided, masked during training)
+- `<output>` — model predicts this for successful commands
+- `<err>` — model predicts this for invalid commands
+- `<eor>` — end of response (model learns when to stop)
+- `<eos>` — end of session
+- `<pad>` — padding
+
+**Label masking:**
+```
+<prompt>mkdir foo<eoi>  <output>  <eor>  <prompt>cat bar<eoi>  <err>  <eor>
+  MASK   MASK MASK MASK   TRAIN   TRAIN    MASK  MASK MASK MASK TRAIN  TRAIN
+```
+
+The model sees everything in attention but only gets gradient on the response tokens. This teaches it: given the full command history, what should the output be?
+
+**Content tokens:** 8 commands (`ls cd pwd touch mkdir rm cat echo`), a-z, 0-9, punctuation (`/ . _ - > >> " space \n`), shell chrome (`@ : #`).
 
 ## Architecture
 
@@ -28,20 +61,34 @@ Can a tiny model learn the *rules* of a filesystem purely from examples? Not pat
 | Precision | bf16 |
 | Hardware | Single RTX 3090 24GB |
 
+## Curriculum stages
+
+| Stage | Adds | Gate |
+|-------|------|------|
+| 1 | `mkdir` `cd` `ls` | val loss < 1.5 |
+| 2 | `pwd` | val loss < 1.5 |
+| 3 | `touch` | val loss < 1.5 |
+| 4 | `echo >` | val loss < 1.5 |
+| 5 | `cat` | val loss < 1.5 |
+| 6 | `echo >>` | val loss < 1.5 |
+| 7 | `rm` | val loss < 1.5 |
+| 8 | `<err>` (intentional errors) | val loss < 1.5 |
+| 9 | anneal (all commands, low LR decay) | runs to completion |
+
+Once a command is introduced, it stays in the training mix forever.
+
 ## Running
 
-Train with defaults (everything is pre-configured for a 3090):
+Curriculum training (pre-configured for a 3090):
 
 ```bash
-python train.py
+python curriculum.py
 ```
 
-Logs go to `checkpoints/train_log.jsonl`. Validation runs every 250 steps.
-
-Resume from checkpoint:
+Monitor training:
 
 ```bash
-python train.py --resume checkpoints/step_005000.pt
+python dashboard.py   # http://localhost:5000
 ```
 
 Interactive inference:
@@ -54,12 +101,14 @@ python sample.py checkpoints/final.pt
 
 | File | What it does |
 |------|-------------|
-| `tokenizer.py` | 61-token vocabulary, encode/decode |
+| `tokenizer.py` | 63-token vocabulary, encode/decode |
 | `generator.py` | Live session generator with filesystem state tracker |
 | `dataset.py` | PyTorch `IterableDataset`, background threads, session packing, label masking |
 | `model.py` | Transformer (RoPE, SwiGLU, flash attention, gradient checkpointing) |
-| `train.py` | Training loop |
+| `curriculum.py` | Staged training with validation gates |
+| `train.py` | Flat training loop (alternative to curriculum) |
 | `sample.py` | Interactive inference |
+| `dashboard.py` | Flask training dashboard with live charts |
 | `verify.py` | Replays transcripts against independent filesystem to prove correctness |
 | `gen_validation.py` | Hand-crafted 369-command validation set building a full Unix filesystem |
 
