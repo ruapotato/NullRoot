@@ -282,11 +282,13 @@ class BashTransformer(nn.Module):
         self,
         input_ids: torch.Tensor,
         labels: Optional[torch.Tensor] = None,
+        loss_weights: Optional[torch.Tensor] = None,
     ) -> dict[str, torch.Tensor]:
         """
         Args:
             input_ids: (batch, seq_len) token IDs
             labels: (batch, seq_len) target IDs, -100 for ignored positions
+            loss_weights: (batch, seq_len) per-token loss weights (optional)
 
         Returns:
             dict with 'logits' and optionally 'loss'
@@ -317,11 +319,26 @@ class BashTransformer(nn.Module):
             # Shift: predict next token
             shift_logits = logits[:, :-1, :].contiguous()
             shift_labels = labels[:, 1:].contiguous()
-            loss = F.cross_entropy(
-                shift_logits.view(-1, self.config.vocab_size),
-                shift_labels.view(-1),
-                ignore_index=-100,
-            )
+
+            if loss_weights is not None:
+                # Weighted per-token loss
+                shift_weights = loss_weights[:, 1:].contiguous()
+                per_token_loss = F.cross_entropy(
+                    shift_logits.view(-1, self.config.vocab_size),
+                    shift_labels.view(-1),
+                    ignore_index=-100,
+                    reduction="none",
+                )
+                # Apply weights and average over non-ignored tokens
+                weighted = per_token_loss * shift_weights.view(-1)
+                mask = shift_labels.view(-1) != -100
+                loss = weighted[mask].sum() / shift_weights.view(-1)[mask].sum().clamp(min=1)
+            else:
+                loss = F.cross_entropy(
+                    shift_logits.view(-1, self.config.vocab_size),
+                    shift_labels.view(-1),
+                    ignore_index=-100,
+                )
             result["loss"] = loss
 
         return result

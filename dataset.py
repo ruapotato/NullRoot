@@ -21,36 +21,59 @@ from generator import SessionGenerator
 def _build_labels(ids: list[int], tokenizer: BashTokenizer) -> list[int]:
     """Build labels that only train on output/error responses, not input commands.
 
+    Returns (labels, weights):
+    - labels: list[int] — token ids or -100 for fully masked positions
+    - weights: list[float] — per-token loss weight
+
     Masking strategy:
-    - <prompt> token through <eoi> (inclusive): masked (-100)
-      (this is the user's command + structural boundary — not predicted)
-    - <output> token: TRAINED (model must learn to decide success vs error)
-    - <err> token: TRAINED (model must learn to predict errors)
-    - Content between <output>/<err> and <eor>: TRAINED
-    - <eor> token: TRAINED (model must learn when to stop responding)
-    - <eos> token: TRAINED
-    - <pad> token: masked (-100)
+    - <prompt> through <eoi> (inclusive): masked (-100)
+    - Empty responses (<output><eor>): low weight (0.1) — still learned
+      but doesn't dominate gradient
+    - <output> with actual content then <eor>: full weight (1.0)
+    - <err><eor>: full weight (1.0) — error decisions are meaningful
+    - <eos>: full weight (1.0)
+    - <pad>: masked (-100)
     """
     prompt_id = tokenizer.prompt_id
     eoi_id = tokenizer.eoi_id
+    output_id = tokenizer.output_id
+    eor_id = tokenizer.eor_id
     pad_id = tokenizer.pad_id
 
     labels = list(ids)
-    in_prompt = False  # currently inside user input (between <prompt> and <eoi>)
+    weights = [1.0] * len(ids)
+    n = len(ids)
+    in_prompt = False
 
-    for i, tok_id in enumerate(ids):
+    LOW_WEIGHT = 0.1  # weight for empty responses
+
+    i = 0
+    while i < n:
+        tok_id = ids[i]
+
         if tok_id == prompt_id:
             labels[i] = -100
+            weights[i] = 0.0
             in_prompt = True
         elif in_prompt:
             labels[i] = -100
+            weights[i] = 0.0
             if tok_id == eoi_id:
                 in_prompt = False
+        elif tok_id == output_id:
+            # Check if empty response: <output><eor>
+            if i + 1 < n and ids[i + 1] == eor_id:
+                weights[i] = LOW_WEIGHT
+                weights[i + 1] = LOW_WEIGHT
+                i += 1
+            # else: content response — keep full weight
         elif tok_id == pad_id:
             labels[i] = -100
-        # <output>, <err>, <eor>, <eos>, content (\n included): trained
+            weights[i] = 0.0
 
-    return labels
+        i += 1
+
+    return labels, weights
 
 
 class BashSessionDataset(IterableDataset):
@@ -102,6 +125,7 @@ class BashSessionDataset(IterableDataset):
         # Accumulators for packing
         id_buf: list[int] = []
         label_buf: list[int] = []
+        weight_buf: list[float] = []
 
         while not self._stop_event.is_set():
             seed_counter += 1
@@ -120,22 +144,26 @@ class BashSessionDataset(IterableDataset):
             except ValueError:
                 continue
 
-            labels = _build_labels(ids, tok)
+            labels, weights = _build_labels(ids, tok)
             id_buf.extend(ids)
             label_buf.extend(labels)
+            weight_buf.extend(weights)
 
             # Emit full windows as they fill up
             while len(id_buf) >= self.seq_len:
                 window_ids = id_buf[: self.seq_len]
                 window_labels = label_buf[: self.seq_len]
+                window_weights = weight_buf[: self.seq_len]
                 id_buf = id_buf[self.seq_len :]
                 label_buf = label_buf[self.seq_len :]
+                weight_buf = weight_buf[self.seq_len :]
 
                 token_ids = torch.tensor(window_ids, dtype=torch.long)
                 labels_t = torch.tensor(window_labels, dtype=torch.long)
+                weights_t = torch.tensor(window_weights, dtype=torch.float32)
 
                 try:
-                    self._queue.put((token_ids, labels_t), timeout=1.0)
+                    self._queue.put((token_ids, labels_t, weights_t), timeout=1.0)
                 except queue.Full:
                     if self._stop_event.is_set():
                         return
@@ -197,18 +225,20 @@ class BashValidationDataset(torch.utils.data.Dataset):
         if len(ids) >= self.seq_len:
             ids = ids[: self.seq_len]
 
-        labels = _build_labels(ids, self.tokenizer)
+        labels, weights = _build_labels(ids, self.tokenizer)
 
         # Pad
         pad_len = self.seq_len - len(ids)
         if pad_len > 0:
             ids = ids + [self.pad_id] * pad_len
             labels = labels + [-100] * pad_len
+            weights = weights + [0.0] * pad_len
 
         token_ids = torch.tensor(ids, dtype=torch.long)
         labels_t = torch.tensor(labels, dtype=torch.long)
+        weights_t = torch.tensor(weights, dtype=torch.float32)
 
-        return token_ids, labels_t
+        return token_ids, labels_t, weights_t
 
 
 if __name__ == "__main__":

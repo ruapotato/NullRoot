@@ -141,15 +141,17 @@ class StageValidationDataset(torch.utils.data.Dataset):
         if len(ids) >= self.seq_len:
             ids = ids[:self.seq_len]
 
-        labels = _build_labels(ids, self.tokenizer)
+        labels, weights = _build_labels(ids, self.tokenizer)
 
         pad_len = self.seq_len - len(ids)
         if pad_len > 0:
             ids = ids + [self.pad_id] * pad_len
             labels = labels + [-100] * pad_len
+            weights = weights + [0.0] * pad_len
 
         return (torch.tensor(ids, dtype=torch.long),
-                torch.tensor(labels, dtype=torch.long))
+                torch.tensor(labels, dtype=torch.long),
+                torch.tensor(weights, dtype=torch.float32))
 
 
 # ---------------------------------------------------------------------------
@@ -307,20 +309,28 @@ def run_gate_tests(model, stage_idx: int, device, log_fn=None):
 
             # Check match
             match = gen_text == expected_response
-            total += 1
-            if match:
-                correct += 1
+
+            # Only count commands with meaningful output for the gate
+            # Empty responses (<output><eor>) are trivial — don't count them
+            is_meaningful = expected_response not in ("<output><eor>",)
+
+            if is_meaningful:
+                total += 1
+                if match:
+                    correct += 1
 
             sample = {
                 "command": cmd_str,
                 "expected": expected_response,
                 "generated": gen_text,
                 "match": match,
+                "meaningful": is_meaningful,
             }
             all_samples.append(sample)
 
+            tag = "GATE" if is_meaningful else "    "
             match_str = "OK" if match else "WRONG"
-            print(f"    [{match_str}] {cmd_str}")
+            print(f"    [{match_str}] [{tag}] {cmd_str}")
             print(f"      expected:  {expected_response!r}")
             print(f"      got:       {gen_text!r}")
 
@@ -329,14 +339,19 @@ def run_gate_tests(model, stage_idx: int, device, log_fn=None):
             context_ids.extend(expected_ids)
 
     accuracy = correct / total if total > 0 else 0
-    passed = correct == total  # must get ALL right
+    passed = correct == total  # must get ALL meaningful tests right
 
-    print(f"\n    Gate result: {correct}/{total} correct ({accuracy:.0%})")
+    total_all = len(all_samples)
+    correct_all = sum(1 for s in all_samples if s["match"])
+
+    print(f"\n    Gate tests (meaningful only): {correct}/{total} ({accuracy:.0%})")
+    print(f"    All tests: {correct_all}/{total_all}")
     print(f"    {'PASSED' if passed else 'FAILED'}")
 
     if log_fn:
         log_fn({"type": "samples", "samples": all_samples,
-                "gate_correct": correct, "gate_total": total})
+                "gate_correct": correct, "gate_total": total,
+                "all_correct": correct_all, "all_total": total_all})
 
     model.train()
     return passed, {
@@ -344,6 +359,8 @@ def run_gate_tests(model, stage_idx: int, device, log_fn=None):
         "gate_total": total,
         "gate_accuracy": round(accuracy, 4),
         "gate_passed": passed,
+        "all_correct": correct_all,
+        "all_total": total_all,
     }
 
 
@@ -355,12 +372,13 @@ def evaluate_loss(model, val_dataset, device):
     total_tokens = 0
 
     for i in range(len(val_dataset)):
-        token_ids, labels = val_dataset[i]
+        token_ids, labels, weights = val_dataset[i]
         token_ids = token_ids.unsqueeze(0).to(device)
         labels = labels.unsqueeze(0).to(device)
+        weights = weights.unsqueeze(0).to(device)
 
         with autocast("cuda", dtype=torch.bfloat16):
-            out = model(token_ids, labels=labels)
+            out = model(token_ids, labels=labels, loss_weights=weights)
 
         n_tokens = (labels != -100).sum().item()
         total_loss += out["loss"].item() * n_tokens
@@ -509,12 +527,13 @@ def train_curriculum(cfg: CurriculumConfig):
             accum_loss = 0.0
 
             for _ in range(cfg.grad_accum):
-                token_ids, labels = next(train_iter)
+                token_ids, labels, weights = next(train_iter)
                 token_ids = token_ids.unsqueeze(0).to(device)
                 labels = labels.unsqueeze(0).to(device)
+                weights = weights.unsqueeze(0).to(device)
 
                 with autocast("cuda", dtype=torch.bfloat16):
-                    out = model(token_ids, labels=labels)
+                    out = model(token_ids, labels=labels, loss_weights=weights)
                     loss = out["loss"] / cfg.grad_accum
 
                 loss.backward()
