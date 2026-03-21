@@ -17,25 +17,32 @@ LOG_PATH = os.path.join(os.path.dirname(__file__) or ".", "checkpoints", "train_
 def read_log():
     train = []
     evals = []
+    gates = []
+    stages = []
     if not os.path.exists(LOG_PATH):
-        return train, evals
+        return train, evals, gates, stages
     with open(LOG_PATH) as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
             entry = json.loads(line)
-            if entry.get("type") in ("eval", "final_eval"):
+            t = entry.get("type")
+            if t == "gate_check":
+                gates.append(entry)
+            elif t == "stage_start":
+                stages.append(entry)
+            elif t in ("eval", "final_eval"):
                 evals.append(entry)
             elif "loss" in entry:
                 train.append(entry)
-    return train, evals
+    return train, evals, gates, stages
 
 
 @app.route("/api/data")
 def api_data():
-    train, evals = read_log()
-    return {"train": train, "evals": evals}
+    train, evals, gates, stages = read_log()
+    return {"train": train, "evals": evals, "gates": gates, "stages": stages}
 
 
 @app.route("/")
@@ -60,11 +67,23 @@ HTML = """<!DOCTYPE html>
   .stat { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 14px; text-align: center; }
   .stat .value { font-size: 24px; color: #58a6ff; font-weight: bold; }
   .stat .label { font-size: 11px; color: #8b949e; margin-top: 4px; }
-  .eval-table { width: 100%; border-collapse: collapse; font-size: 13px; }
-  .eval-table th { text-align: left; color: #58a6ff; padding: 6px 10px; border-bottom: 1px solid #30363d; }
-  .eval-table td { padding: 6px 10px; border-bottom: 1px solid #21262d; }
   .full { grid-column: 1 / -1; }
   #status { color: #3fb950; font-size: 12px; }
+
+  .stage-banner { background: #161b22; border: 1px solid #58a6ff; border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+  .stage-banner h2 { color: #58a6ff; font-size: 16px; margin-bottom: 8px; }
+  .stage-pipeline { display: flex; gap: 4px; margin-top: 10px; }
+  .stage-pip { flex: 1; height: 8px; border-radius: 4px; background: #21262d; }
+  .stage-pip.done { background: #3fb950; }
+  .stage-pip.active { background: #58a6ff; animation: pulse 1.5s infinite; }
+  .stage-pip.pending { background: #21262d; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
+
+  .tbl { width: 100%; border-collapse: collapse; font-size: 13px; }
+  .tbl th { text-align: left; color: #58a6ff; padding: 6px 10px; border-bottom: 1px solid #30363d; }
+  .tbl td { padding: 6px 10px; border-bottom: 1px solid #21262d; }
+  .pass { color: #3fb950; font-weight: bold; }
+  .fail { color: #f85149; }
 </style>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
 </head>
@@ -73,14 +92,20 @@ HTML = """<!DOCTYPE html>
 <h1>NullRoot Training Dashboard</h1>
 <p class="subtitle">~20M param transformer learning to simulate bash &nbsp; <span id="status">connecting...</span></p>
 
+<div class="stage-banner">
+  <h2 id="stage-title">Waiting for data...</h2>
+  <div id="stage-desc" style="color:#8b949e; font-size:13px;"></div>
+  <div class="stage-pipeline" id="stage-pipeline"></div>
+</div>
+
 <div class="stats">
-  <div class="stat"><div class="value" id="s-step">-</div><div class="label">Step</div></div>
+  <div class="stat"><div class="value" id="s-step">-</div><div class="label">Global Step</div></div>
   <div class="stat"><div class="value" id="s-loss">-</div><div class="label">Train Loss</div></div>
   <div class="stat"><div class="value" id="s-ppl">-</div><div class="label">Perplexity</div></div>
   <div class="stat"><div class="value" id="s-speed">-</div><div class="label">Tokens/sec</div></div>
 </div>
 <div class="stats">
-  <div class="stat"><div class="value" id="s-eta">-</div><div class="label">ETA</div></div>
+  <div class="stat"><div class="value" id="s-gate">-</div><div class="label">Gate Val Loss</div></div>
   <div class="stat"><div class="value" id="s-lr">-</div><div class="label">Learning Rate</div></div>
   <div class="stat"><div class="value" id="s-gnorm">-</div><div class="label">Grad Norm</div></div>
   <div class="stat"><div class="value" id="s-gpu">-</div><div class="label">GPU Peak (GB)</div></div>
@@ -95,10 +120,10 @@ HTML = """<!DOCTYPE html>
 
 <div class="grid">
   <div class="card full">
-    <h2>Validation Results</h2>
-    <table class="eval-table" id="evalTable">
-      <thead><tr><th>Step</th><th>Val Loss</th><th>Val PPL</th><th>Tokens</th><th>Time</th></tr></thead>
-      <tbody id="evalBody"><tr><td colspan="5" style="color:#8b949e">No evaluations yet</td></tr></tbody>
+    <h2>Gate Checks</h2>
+    <table class="tbl" id="gateTable">
+      <thead><tr><th>Stage</th><th>Step</th><th>Val Loss</th><th>Val PPL</th><th>Threshold</th><th>Result</th><th>Time</th></tr></thead>
+      <tbody id="gateBody"><tr><td colspan="7" style="color:#8b949e">No gate checks yet</td></tr></tbody>
     </table>
   </div>
 </div>
@@ -119,8 +144,36 @@ const pplChart  = new Chart(document.getElementById('pplChart'),  chartOpts('PPL
 const lrChart   = new Chart(document.getElementById('lrChart'),   chartOpts('LR',   '#3fb950'));
 const speedChart= new Chart(document.getElementById('speedChart'),chartOpts('tok/s','#58a6ff'));
 
+const STAGE_NAMES = [
+  'mkdir+cd+ls', '+pwd', '+touch', '+echo>', '+cat', '+echo>>', '+rm', '+errors'
+];
+const GATE_THRESHOLD = 1.5;
+
 function update(data) {
   const t = data.train;
+  const gates = data.gates || [];
+  const stages = data.stages || [];
+
+  // Stage pipeline
+  const currentStage = t.length ? t[t.length-1].stage : (stages.length ? stages[stages.length-1].stage : 0);
+  const passedStages = new Set(gates.filter(g => g.val_loss < GATE_THRESHOLD).map(g => g.stage));
+  const pipeline = document.getElementById('stage-pipeline');
+  pipeline.innerHTML = STAGE_NAMES.map((name, i) => {
+    let cls = 'stage-pip ';
+    if (passedStages.has(i)) cls += 'done';
+    else if (i === currentStage) cls += 'active';
+    else cls += 'pending';
+    return '<div class="' + cls + '" title="S' + i + ': ' + name + '"></div>';
+  }).join('');
+
+  const stageTitle = document.getElementById('stage-title');
+  const stageDesc = document.getElementById('stage-desc');
+  if (stages.length) {
+    const latest = stages[stages.length-1];
+    stageTitle.textContent = latest.name || ('Stage ' + latest.stage);
+    stageDesc.textContent = 'Stage ' + (currentStage+1) + '/8 | ' + passedStages.size + ' gates passed';
+  }
+
   if (!t.length) return;
 
   const steps = t.map(e => e.step);
@@ -148,20 +201,28 @@ function update(data) {
   document.getElementById('s-gnorm').textContent = last.grad_norm.toFixed(2);
   document.getElementById('s-gpu').textContent = (last.gpu_peak_gb || 0).toFixed(1);
 
-  const eta_s = last.eta_sec || 0;
-  const hrs = Math.floor(eta_s / 3600);
-  const mins = Math.floor((eta_s % 3600) / 60);
-  document.getElementById('s-eta').textContent = hrs + 'h ' + mins + 'm';
+  // Latest gate val loss
+  if (gates.length) {
+    const lastGate = gates[gates.length - 1];
+    const el = document.getElementById('s-gate');
+    el.textContent = lastGate.val_loss.toFixed(4);
+    el.style.color = lastGate.val_loss < GATE_THRESHOLD ? '#3fb950' : '#f85149';
+  }
 
-  // Eval table
-  const evals = data.evals;
-  const tbody = document.getElementById('evalBody');
-  if (evals.length) {
-    tbody.innerHTML = evals.map(e =>
-      '<tr><td>' + e.step + '</td><td>' + (e.val_loss||0).toFixed(4) + '</td><td>' +
-      (e.val_ppl||0).toFixed(2) + '</td><td>' + (e.val_tokens||0).toLocaleString() +
-      '</td><td>' + (e.timestamp||'') + '</td></tr>'
-    ).join('');
+  // Gate table
+  const gateBody = document.getElementById('gateBody');
+  if (gates.length) {
+    gateBody.innerHTML = gates.map(g => {
+      const passed = g.val_loss < GATE_THRESHOLD;
+      return '<tr>' +
+        '<td>S' + g.stage + ': ' + STAGE_NAMES[g.stage] + '</td>' +
+        '<td>' + g.step + '</td>' +
+        '<td>' + g.val_loss.toFixed(4) + '</td>' +
+        '<td>' + g.val_ppl.toFixed(2) + '</td>' +
+        '<td>' + GATE_THRESHOLD + '</td>' +
+        '<td class="' + (passed ? 'pass' : 'fail') + '">' + (passed ? 'PASS' : 'FAIL') + '</td>' +
+        '<td>' + (g.timestamp||'') + '</td></tr>';
+    }).join('');
   }
 
   document.getElementById('status').textContent = 'updated ' + new Date().toLocaleTimeString();
