@@ -24,7 +24,7 @@ from torch.utils.checkpoint import checkpoint
 
 @dataclass
 class BashTransformerConfig:
-    vocab_size: int = 61
+    vocab_size: int = 63
     hidden_dim: int = 512
     num_layers: int = 6
     num_heads: int = 8

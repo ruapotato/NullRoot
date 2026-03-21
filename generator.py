@@ -388,13 +388,14 @@ class SessionGenerator:
         self.commands = commands if commands is not None else self.ALL_COMMANDS
 
     def _emit(self, prompt_cmd: str, output: str | None = None, is_error: bool = False):
-        part = f"<prompt>{prompt_cmd}\n"
+        # Format: <prompt>command<eoi><output>content<eor> or <prompt>command<eoi><err><eor>
+        part = f"<prompt>{prompt_cmd}<eoi>"
         if is_error:
-            part += "<err>\n"
+            part += "<err><eor>"
         elif output:
-            part += f"<output>{output}\n"
+            part += f"<output>{output}<eor>"
         else:
-            part += "<output>\n"
+            part += "<output><eor>"
         self.transcript_parts.append(part)
 
     def _choose_num_ops(self) -> int:

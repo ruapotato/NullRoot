@@ -17,13 +17,14 @@ def build_validation_transcript() -> str:
     lines = []
 
     def cmd(c: str, output: str | None = None, err: bool = False):
-        lines.append(f"<prompt>{c}")
+        part = f"<prompt>{c}<eoi>"
         if err:
-            lines.append("<err>")
+            part += "<err><eor>"
         elif output is not None:
-            lines.append(f"<output>{output}")
+            part += f"<output>{output}<eor>"
         else:
-            lines.append("<output>")
+            part += "<output><eor>"
+        lines.append(part)
 
     # --- Start at empty root ---
     cmd("pwd", "/")
@@ -424,7 +425,7 @@ def build_validation_transcript() -> str:
     cmd("pwd", "/")
     cmd("ls", "etc  home  opt  srv  tmp  usr  var")
 
-    transcript = "\n".join(lines) + "\n<eos>"
+    transcript = "".join(lines) + "<eos>"
     return transcript
 
 

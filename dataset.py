@@ -22,35 +22,33 @@ def _build_labels(ids: list[int], tokenizer: BashTokenizer) -> list[int]:
     """Build labels that only train on output/error responses, not input commands.
 
     Masking strategy:
-    - <prompt> token and everything after it until the newline: masked (-100)
-      (this is the user's command — we don't predict it)
+    - <prompt> token through <eoi> (inclusive): masked (-100)
+      (this is the user's command + structural boundary — not predicted)
     - <output> token: TRAINED (model must learn to decide success vs error)
-    - Content after <output> until next <prompt> or <eos>: TRAINED
     - <err> token: TRAINED (model must learn to predict errors)
-    - Content after <err> until next <prompt> or <eos>: TRAINED
-    - <eos> token: TRAINED (model must learn to emit it)
+    - Content between <output>/<err> and <eor>: TRAINED
+    - <eor> token: TRAINED (model must learn when to stop responding)
+    - <eos> token: TRAINED
     - <pad> token: masked (-100)
     """
     prompt_id = tokenizer.prompt_id
+    eoi_id = tokenizer.eoi_id
     pad_id = tokenizer.pad_id
-    newline_id = tokenizer.newline_id
 
     labels = list(ids)
-    in_prompt = False  # currently inside a command (between <prompt> and \n)
+    in_prompt = False  # currently inside user input (between <prompt> and <eoi>)
 
     for i, tok_id in enumerate(ids):
         if tok_id == prompt_id:
-            # Mask the <prompt> token and start masking the command
             labels[i] = -100
             in_prompt = True
         elif in_prompt:
-            # Mask command tokens until we hit newline
             labels[i] = -100
-            if tok_id == newline_id:
+            if tok_id == eoi_id:
                 in_prompt = False
         elif tok_id == pad_id:
             labels[i] = -100
-        # <output>, <err>, <eos>, and all output content: keep as-is (trained)
+        # <output>, <err>, <eor>, <eos>, content (\n included): trained
 
     return labels
 

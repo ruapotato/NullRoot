@@ -42,12 +42,11 @@ def generate(
     temperature: float = 0.0,
     device: torch.device = torch.device("cpu"),
 ) -> list[int]:
-    """Generate tokens until <prompt>, <eos>, or max length.
+    """Generate tokens until <eor>, <eos>, or max length.
 
-    Stops when the model emits a <prompt> token (it's the user's turn)
-    or <eos>.
+    Stops when the model emits <eor> (end of response) or <eos>.
     """
-    prompt_id = tokenizer.prompt_id
+    eor_id = tokenizer.eor_id
     eos_id = tokenizer.eos_id
 
     generated = []
@@ -67,8 +66,8 @@ def generate(
         token_ids.append(next_id)
         generated.append(next_id)
 
-        # Stop on <prompt> (user's turn) or <eos>
-        if next_id == prompt_id or next_id == eos_id:
+        # Stop on <eor> (response done) or <eos> (session done)
+        if next_id == eor_id or next_id == eos_id:
             break
 
     return generated
@@ -114,8 +113,8 @@ def interactive(args):
         if cmd.strip() == "exit":
             break
 
-        # Encode: <prompt>command\n
-        cmd_text = f"<prompt>{cmd}\n"
+        # Encode: <prompt>command<eoi>
+        cmd_text = f"<prompt>{cmd}<eoi>"
         cmd_ids = tokenizer.encode(cmd_text)
         context_ids.extend(cmd_ids)
 
@@ -132,7 +131,7 @@ def interactive(args):
 
         # Clean up for display
         display = response_text
-        for tag in ["<output>", "<err>", "<prompt>", "<eos>"]:
+        for tag in ["<output>", "<err>", "<eor>", "<prompt>", "<eos>", "<eoi>"]:
             display = display.replace(tag, "")
         display = display.strip()
 

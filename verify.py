@@ -23,77 +23,43 @@ def parse_transcript(transcript: str) -> list[tuple[str, str | None, bool]]:
     """Parse a TTY transcript into a list of (command, output_or_none, is_error) tuples.
 
     Format:
-        <prompt>command
-        <output>content     (normal output with content)
-        <output>            (normal output, no content — silent command)
-        <err>               (error output)
+        <prompt>command<eoi><output>content<eor>   (success with content)
+        <prompt>command<eoi><output><eor>          (success, no content)
+        <prompt>command<eoi><err><eor>             (error)
     Ends with <eos>.
     """
-    # Strip trailing <eos> and whitespace
     text = transcript.strip()
     if text.endswith("<eos>"):
-        text = text[:-5].strip()
+        text = text[:-5]
 
     exchanges = []
 
     # Split on <prompt> to get each exchange
-    # The first split element before the first <prompt> is empty (or whitespace)
     parts = text.split("<prompt>")
 
     for part in parts:
-        part = part.strip()
         if not part:
             continue
 
-        # Each part is: "command\n<output>content" or "command\n<err>" or "command\n<output>"
-        if "\n<err>" in part:
-            # Error case: command\n<err>\n... (possibly trailing)
-            idx = part.index("\n<err>")
-            command = part[:idx].strip()
+        # Each part is: command<eoi><output>content<eor> or command<eoi><err><eor>
+        if "<eoi>" not in part:
+            continue
+
+        cmd_part, response_part = part.split("<eoi>", 1)
+        command = cmd_part
+
+        # Strip trailing <eor>
+        if response_part.endswith("<eor>"):
+            response_part = response_part[:-5]
+
+        if response_part.startswith("<err>"):
             exchanges.append((command, None, True))
-        elif "\n<output>" in part:
-            idx = part.index("\n<output>")
-            command = part[:idx].strip()
-            rest = part[idx + len("\n<output>"):]
-            # rest may be empty (silent command) or contain output content
-            # Output content follows immediately after <output>, terminated by
-            # a single trailing newline (the delimiter).  We must NOT strip
-            # leading newlines — they can be part of the content.
-            if rest == "" or rest == "\n":
-                output = None
-            else:
-                # Remove exactly the trailing delimiter newline
-                if rest.endswith("\n"):
-                    output = rest[:-1]
-                else:
-                    output = rest
-                if output == "":
-                    output = None
+        elif response_part.startswith("<output>"):
+            content = response_part[8:]  # len("<output>") == 8
+            output = content if content else None
             exchanges.append((command, output, False))
-        elif "<output>" in part:
-            # Handle case where <output> is on same line as command (no newline between)
-            idx = part.index("<output>")
-            command = part[:idx].strip()
-            rest = part[idx + len("<output>"):]
-            if rest == "" or rest == "\n":
-                output = None
-            else:
-                if rest.endswith("\n"):
-                    output = rest[:-1]
-                else:
-                    output = rest
-                if output == "":
-                    output = None
-            exchanges.append((command, output, False))
-        elif "<err>" in part:
-            idx = part.index("<err>")
-            command = part[:idx].strip()
-            exchanges.append((command, None, True))
         else:
-            # Bare command with no response marker — shouldn't happen in valid transcript
-            command = part.strip()
-            if command:
-                exchanges.append((command, None, False))
+            exchanges.append((command, None, False))
 
     return exchanges
 
@@ -512,86 +478,86 @@ if __name__ == "__main__":
 
     # Empty directory ls
     micro_test("ls on empty root",
-        "<prompt>ls\n<output>\n<eos>")
+        "<prompt>ls<eoi><output><eor><eos>")
 
     # mkdir + ls
     micro_test("mkdir then ls",
-        "<prompt>mkdir foo\n<output>\n"
-        "<prompt>ls\n<output>foo\n<eos>")
+        "<prompt>mkdir foo<eoi><output><eor>"
+        "<prompt>ls<eoi><output>foo<eor><eos>")
 
     # touch + cat empty file
     micro_test("touch then cat empty",
-        "<prompt>mkdir dir\n<output>\n"
-        "<prompt>cd dir\n<output>\n"
-        "<prompt>touch f\n<output>\n"
-        "<prompt>cat f\n<output>\n<eos>")
+        "<prompt>mkdir dir<eoi><output><eor>"
+        "<prompt>cd dir<eoi><output><eor>"
+        "<prompt>touch f<eoi><output><eor>"
+        "<prompt>cat f<eoi><output><eor><eos>")
 
     # echo write + cat
     micro_test("echo write then cat",
-        "<prompt>echo hello world > greet.txt\n<output>\n"
-        "<prompt>cat greet.txt\n<output>hello world\n<eos>")
+        "<prompt>echo hello world > greet.txt<eoi><output><eor>"
+        "<prompt>cat greet.txt<eoi><output>hello world<eor><eos>")
 
-    # echo append + cat
+    # echo append + cat (multiline content with real \n)
     micro_test("echo append",
-        "<prompt>echo line1 > f.txt\n<output>\n"
-        "<prompt>echo line2 >> f.txt\n<output>\n"
-        "<prompt>cat f.txt\n<output>line1\nline2\n<eos>")
+        "<prompt>echo line1 > f.txt<eoi><output><eor>"
+        "<prompt>echo line2 >> f.txt<eoi><output><eor>"
+        "<prompt>cat f.txt<eoi><output>line1\nline2<eor><eos>")
 
     # cd + pwd
     micro_test("cd and pwd",
-        "<prompt>mkdir a\n<output>\n"
-        "<prompt>cd a\n<output>\n"
-        "<prompt>pwd\n<output>/a\n<eos>")
+        "<prompt>mkdir a<eoi><output><eor>"
+        "<prompt>cd a<eoi><output><eor>"
+        "<prompt>pwd<eoi><output>/a<eor><eos>")
 
     # cd .. back to root
     micro_test("cd .. to root",
-        "<prompt>mkdir x\n<output>\n"
-        "<prompt>cd x\n<output>\n"
-        "<prompt>cd ..\n<output>\n"
-        "<prompt>pwd\n<output>/\n<eos>")
+        "<prompt>mkdir x<eoi><output><eor>"
+        "<prompt>cd x<eoi><output><eor>"
+        "<prompt>cd ..<eoi><output><eor>"
+        "<prompt>pwd<eoi><output>/<eor><eos>")
 
     # rm
     micro_test("rm file",
-        "<prompt>echo data > tmp.txt\n<output>\n"
-        "<prompt>rm tmp.txt\n<output>\n"
-        "<prompt>ls\n<output>\n<eos>")
+        "<prompt>echo data > tmp.txt<eoi><output><eor>"
+        "<prompt>rm tmp.txt<eoi><output><eor>"
+        "<prompt>ls<eoi><output><eor><eos>")
 
     # Error: cd nonexistent
     micro_test("cd nonexistent error",
-        "<prompt>cd nope\n<err>\n<eos>")
+        "<prompt>cd nope<eoi><err><eor><eos>")
 
     # Error: cat nonexistent
     micro_test("cat nonexistent error",
-        "<prompt>cat nope.txt\n<err>\n<eos>")
+        "<prompt>cat nope.txt<eoi><err><eor><eos>")
 
     # Error: mkdir existing
     micro_test("mkdir existing error",
-        "<prompt>mkdir foo\n<output>\n"
-        "<prompt>mkdir foo\n<err>\n<eos>")
+        "<prompt>mkdir foo<eoi><output><eor>"
+        "<prompt>mkdir foo<eoi><err><eor><eos>")
 
     # Error: rm nonexistent
     micro_test("rm nonexistent error",
-        "<prompt>rm nope.txt\n<err>\n<eos>")
+        "<prompt>rm nope.txt<eoi><err><eor><eos>")
 
     # Intentional mismatch: wrong ls output
     micro_test("intentional mismatch in ls (expect fail)",
-        "<prompt>mkdir aaa\n<output>\n"
-        "<prompt>ls\n<output>bbb\n<eos>",
+        "<prompt>mkdir aaa<eoi><output><eor>"
+        "<prompt>ls<eoi><output>bbb<eor><eos>",
         expect_pass=False)
 
     # Intentional mismatch: wrong cat output
     micro_test("intentional mismatch in cat (expect fail)",
-        "<prompt>echo real content > f.txt\n<output>\n"
-        "<prompt>cat f.txt\n<output>wrong content\n<eos>",
+        "<prompt>echo real content > f.txt<eoi><output><eor>"
+        "<prompt>cat f.txt<eoi><output>wrong content<eor><eos>",
         expect_pass=False)
 
     # Absolute cd
     micro_test("absolute cd",
-        "<prompt>mkdir a\n<output>\n"
-        "<prompt>cd a\n<output>\n"
-        "<prompt>mkdir b\n<output>\n"
-        "<prompt>cd /a/b\n<output>\n"
-        "<prompt>pwd\n<output>/a/b\n<eos>")
+        "<prompt>mkdir a<eoi><output><eor>"
+        "<prompt>cd a<eoi><output><eor>"
+        "<prompt>mkdir b<eoi><output><eor>"
+        "<prompt>cd /a/b<eoi><output><eor>"
+        "<prompt>pwd<eoi><output>/a/b<eor><eos>")
 
     print(f"\n  Edge-case micro-tests: {edge_cases_passed}/{edge_cases_total} passed")
     if edge_cases_passed != edge_cases_total:

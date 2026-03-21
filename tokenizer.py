@@ -21,8 +21,8 @@ class BashTokenizer:
         # Punctuation (9)
         punctuation = ["/", ".", "_", "-", ">", ">>", '"', " ", "\n"]
 
-        # Special tokens (5)
-        special = ["<prompt>", "<output>", "<err>", "<pad>", "<eos>"]
+        # Special tokens (7)
+        special = ["<prompt>", "<eoi>", "<output>", "<err>", "<eor>", "<pad>", "<eos>"]
 
         # Shell chrome (3)
         chrome = ["@", ":", "#"]
@@ -38,8 +38,10 @@ class BashTokenizer:
         self.pad_id = self.token_to_id["<pad>"]
         self.eos_id = self.token_to_id["<eos>"]
         self.prompt_id = self.token_to_id["<prompt>"]
+        self.eoi_id = self.token_to_id["<eoi>"]     # end of input
         self.output_id = self.token_to_id["<output>"]
         self.err_id = self.token_to_id["<err>"]
+        self.eor_id = self.token_to_id["<eor>"]     # end of response
         self.newline_id = self.token_to_id["\n"]
         self.space_id = self.token_to_id[" "]
 

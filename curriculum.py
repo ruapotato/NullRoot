@@ -159,7 +159,7 @@ class StageValidationDataset(torch.utils.data.Dataset):
 @torch.no_grad()
 def generate_response(model, prompt_ids: list[int], tokenizer: BashTokenizer,
                       device, max_tokens: int = 512) -> list[int]:
-    """Generate tokens from the model until <prompt>, <eos>, or max length."""
+    """Generate tokens from the model until <eor>, <eos>, or max length."""
     ids = list(prompt_ids)
     for _ in range(max_tokens):
         input_t = torch.tensor([ids], dtype=torch.long, device=device)
@@ -167,7 +167,7 @@ def generate_response(model, prompt_ids: list[int], tokenizer: BashTokenizer,
             out = model(input_t)
         next_id = out["logits"][0, -1, :].argmax().item()
         ids.append(next_id)
-        if next_id in (tokenizer.prompt_id, tokenizer.eos_id):
+        if next_id in (tokenizer.eor_id, tokenizer.eos_id):
             break
     return ids[len(prompt_ids):]
 
@@ -215,23 +215,22 @@ def evaluate(model, val_dataset, device, tokenizer=None, num_samples=5, log_fn=N
             test_positions = prompt_positions[:num_samples]
 
         for pos in test_positions:
-            # Context = everything up to and including this command's newline
+            # Context = everything up to and including <eoi>
             ctx_end = pos
             for k in range(pos + 1, min(pos + 100, len(val_ids))):
-                ctx_end = k
-                if val_ids[k] == tok.newline_id:
-                    ctx_end = k + 1
+                ctx_end = k + 1
+                if val_ids[k] == tok.eoi_id:
                     break
 
             context = val_ids[:ctx_end]
             command_text = tok.decode(val_ids[pos:ctx_end])
 
-            # Find expected output (everything from ctx_end until next <prompt> or <eos>)
+            # Find expected output (everything from ctx_end until <eor> inclusive)
             expected_end = ctx_end
             for k in range(ctx_end, min(ctx_end + 500, len(val_ids))):
-                if val_ids[k] == tok.prompt_id or val_ids[k] == tok.eos_id:
-                    break
                 expected_end = k + 1
+                if val_ids[k] == tok.eor_id:
+                    break
             expected_text = tok.decode(val_ids[ctx_end:expected_end])
 
             # Generate model response
