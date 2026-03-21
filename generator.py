@@ -371,14 +371,21 @@ class SessionGenerator:
     filesystem state.
     """
 
+    # All valid command sets for curriculum stages
+    ALL_COMMANDS = {"mkdir", "cd_child", "cd_up", "cd_abs", "ls", "pwd",
+                    "touch", "echo_write", "cat", "echo_append", "rm"}
+
     def __init__(self, min_ops: int = 300, target_ops: int = 800,
-                 error_rate: float = 0.05, seed: int | None = None):
+                 error_rate: float = 0.05, seed: int | None = None,
+                 commands: set[str] | None = None):
         self.min_ops = min_ops
         self.target_ops = target_ops
         self.error_rate = error_rate
         self.rng = random.Random(seed)
         self.fs = FileSystem()
         self.transcript_parts: list[str] = []
+        # Which commands are enabled (None = all)
+        self.commands = commands if commands is not None else self.ALL_COMMANDS
 
     def _emit(self, prompt_cmd: str, output: str | None = None, is_error: bool = False):
         part = f"<prompt>{prompt_cmd}\n"
@@ -405,71 +412,57 @@ class SessionGenerator:
         return self.fs.cwd.count("/")
 
     def _pick_op(self) -> tuple[str, bool]:
-        """Pick next operation. Returns (op_name, is_error).
-
-        Adapts weights to filesystem state to ensure natural behavior:
-        - Early on: bias toward mkdir/touch/echo to build structure
-        - Deep in tree: more cat/ls/cd to explore
-        - With many files: more append/cat/rm
-        - 5% chance of intentional error
-        """
-        if self.rng.random() < self.error_rate:
+        """Pick next operation. Returns (op_name, is_error)."""
+        # Errors only if enabled (stage 8+)
+        if self.errors_enabled and self.rng.random() < self.error_rate:
             return self._pick_invalid_op(), True
         return self._pick_valid_op(), False
+
+    @property
+    def errors_enabled(self) -> bool:
+        return self.error_rate > 0 and "errors" in self.commands
 
     def _pick_valid_op(self) -> str:
         child_dirs = self.fs.get_child_dirs()
         child_files = self.fs.get_child_files()
         all_dirs = self.fs.get_all_dirs()
-        all_files_count = len(self.fs.files)
-        depth = self._depth()
-        num_dirs = len(self.fs.dirs)
+        enabled = self.commands
 
         pool = []
 
-        # --- Creation ops: stronger early, weaker as fs grows ---
-        # mkdir: high early, tapering as tree grows
-        mkdir_w = max(3, 25 - num_dirs // 5)
-        pool.append(("mkdir", mkdir_w))
+        # Creation
+        if "mkdir" in enabled:
+            pool.append(("mkdir", 15))
+        if "touch" in enabled:
+            pool.append(("touch", 15))
+        if "echo_write" in enabled:
+            pool.append(("echo_write", 15))
+        if "echo_append" in enabled:
+            pool.append(("echo_append", 10))
 
-        # touch: always useful
-        pool.append(("touch", 12))
-
-        # echo > : create files with content
-        pool.append(("echo_write", 14))
-
-        # echo >> : prefer when files exist nearby
-        append_w = 12 if child_files else 4
-        pool.append(("echo_append", append_w))
-
-        # --- Navigation ops ---
-        # cd into child dir
-        if child_dirs:
-            # Bias toward descending when shallow, less when deep
-            cd_child_w = max(5, 18 - depth * 2)
-            pool.append(("cd_child", cd_child_w))
-
-        # cd ..
-        if self.fs.cwd != "/":
-            cd_up_w = max(3, 5 + depth * 2)  # more likely when deep
-            pool.append(("cd_up", cd_up_w))
-
-        # cd to random absolute path
-        if all_dirs:
+        # Navigation
+        if "cd_child" in enabled and child_dirs:
+            pool.append(("cd_child", 15))
+        if "cd_up" in enabled and self.fs.cwd != "/":
+            pool.append(("cd_up", 10))
+        if "cd_abs" in enabled and all_dirs:
             pool.append(("cd_abs", 8))
 
-        # --- Query ops ---
-        pool.append(("ls", 12))
-        pool.append(("pwd", 4))
+        # Query / read
+        if "ls" in enabled:
+            pool.append(("ls", 12))
+        if "pwd" in enabled:
+            pool.append(("pwd", 5))
+        if "cat" in enabled and child_files:
+            pool.append(("cat", 12))
 
-        # cat: only if files here
-        if child_files:
-            pool.append(("cat", 14))
+        # Destructive
+        if "rm" in enabled and child_files:
+            pool.append(("rm", 5))
 
-        # --- Destructive ---
-        if child_files:
-            # rm: low weight, just enough to exercise it
-            pool.append(("rm", 4))
+        if not pool:
+            # Fallback — shouldn't happen but safe
+            pool.append(("ls", 1))
 
         ops, weights = zip(*pool)
         return self.rng.choices(ops, weights=weights, k=1)[0]

@@ -82,6 +82,7 @@ class BashSessionDataset(IterableDataset):
         target_ops: int = 800,
         error_rate: float = 0.05,
         base_seed: int = 42,
+        commands: set[str] | None = None,
     ):
         super().__init__()
         self.seq_len = seq_len
@@ -91,6 +92,7 @@ class BashSessionDataset(IterableDataset):
         self.target_ops = target_ops
         self.error_rate = error_rate
         self.base_seed = base_seed
+        self.commands = commands
 
         self.tokenizer = BashTokenizer()
         self.pad_id = self.tokenizer.pad_id
@@ -117,6 +119,7 @@ class BashSessionDataset(IterableDataset):
                 target_ops=self.target_ops,
                 error_rate=self.error_rate,
                 seed=seed_counter,
+                commands=self.commands,
             )
             transcript = gen.generate()
 
