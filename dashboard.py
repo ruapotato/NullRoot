@@ -120,7 +120,7 @@ HTML = """<!DOCTYPE html>
   <div class="stat"><div class="value" id="s-speed">-</div><div class="label">Tokens/sec</div></div>
 </div>
 <div class="stats">
-  <div class="stat"><div class="value" id="s-gate">-</div><div class="label">Gate Val Loss</div></div>
+  <div class="stat"><div class="value" id="s-gate">-</div><div class="label">Gate Tests</div></div>
   <div class="stat"><div class="value" id="s-lr">-</div><div class="label">Learning Rate</div></div>
   <div class="stat"><div class="value" id="s-gnorm">-</div><div class="label">Grad Norm</div></div>
   <div class="stat"><div class="value" id="s-gpu">-</div><div class="label">GPU Peak (GB)</div></div>
@@ -137,7 +137,7 @@ HTML = """<!DOCTYPE html>
   <div class="card full">
     <h2>Gate Checks</h2>
     <table class="tbl" id="gateTable">
-      <thead><tr><th>Stage</th><th>Step</th><th>Val Loss</th><th>Val PPL</th><th>Threshold</th><th>Result</th><th>Time</th></tr></thead>
+      <thead><tr><th>Stage</th><th>Step</th><th>Tests</th><th>Val Loss</th><th>Val PPL</th><th>Result</th><th>Time</th></tr></thead>
       <tbody id="gateBody"><tr><td colspan="7" style="color:#8b949e">No gate checks yet</td></tr></tbody>
     </table>
   </div>
@@ -166,7 +166,6 @@ const STAGE_NAMES = STAGE_DEFS.map(s => s.label);
 const STAGE_COLORS = [
   '#f85149', '#d29922', '#3fb950', '#58a6ff', '#bc8cff', '#f778ba', '#79c0ff', '#ffa657', '#da7b22'
 ];
-const GATE_THRESHOLD = 1.5;
 
 const chartOpts = (label, color) => ({
   type: 'line',
@@ -226,7 +225,7 @@ function update(data) {
 
   // Stage pipeline
   const currentStage = t.length ? t[t.length-1].stage : (stages.length ? stages[stages.length-1].stage : 0);
-  const passedStages = new Set(gates.filter(g => g.val_loss < GATE_THRESHOLD).map(g => g.stage));
+  const passedStages = new Set(gates.filter(g => g.gate_passed).map(g => g.stage));
   const pipeline = document.getElementById('stage-pipeline');
   pipeline.innerHTML = STAGE_NAMES.map((name, i) => {
     let cls = 'stage-pip ';
@@ -287,21 +286,25 @@ function update(data) {
   if (gates.length) {
     const lastGate = gates[gates.length - 1];
     const el = document.getElementById('s-gate');
-    el.textContent = lastGate.val_loss.toFixed(4);
-    el.style.color = lastGate.val_loss < GATE_THRESHOLD ? '#3fb950' : '#f85149';
+    const gc = lastGate.gate_correct || 0;
+    const gt = lastGate.gate_total || 1;
+    el.textContent = gc + '/' + gt;
+    el.style.color = lastGate.gate_passed ? '#3fb950' : '#f85149';
   }
 
   // Gate table
   const gateBody = document.getElementById('gateBody');
   if (gates.length) {
     gateBody.innerHTML = gates.map(g => {
-      const passed = g.val_loss < GATE_THRESHOLD;
+      const passed = g.gate_passed;
+      const gc = g.gate_correct || 0;
+      const gt = g.gate_total || 0;
       return '<tr>' +
         '<td>S' + g.stage + ': ' + STAGE_NAMES[g.stage] + '</td>' +
         '<td>' + g.step + '</td>' +
-        '<td>' + g.val_loss.toFixed(4) + '</td>' +
-        '<td>' + g.val_ppl.toFixed(2) + '</td>' +
-        '<td>' + GATE_THRESHOLD + '</td>' +
+        '<td>' + gc + '/' + gt + '</td>' +
+        '<td>' + (g.val_loss||0).toFixed(4) + '</td>' +
+        '<td>' + (g.val_ppl||0).toFixed(2) + '</td>' +
         '<td class="' + (passed ? 'pass' : 'fail') + '">' + (passed ? 'PASS' : 'FAIL') + '</td>' +
         '<td>' + (g.timestamp||'') + '</td></tr>';
     }).join('');

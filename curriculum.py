@@ -153,6 +153,114 @@ class StageValidationDataset(torch.utils.data.Dataset):
 
 
 # ---------------------------------------------------------------------------
+# Targeted gate tests — concrete scenarios per stage
+# ---------------------------------------------------------------------------
+
+# Each test is a list of (command, expected_response) pairs.
+# The test runner feeds them sequentially, building context.
+# The gate passes only if ALL tests pass for the stage.
+
+def _build_gate_tests(stage_idx: int) -> list[list[tuple[str, str]]]:
+    """Build targeted test scripts for a curriculum stage.
+
+    Returns a list of test scripts. Each script is a list of
+    (command_str, expected_response_str) tuples.
+    The expected_response includes <output>/<err> and <eor>.
+    """
+    tests = []
+
+    if stage_idx >= 0:  # Stage 1: mkdir + cd + ls
+        # Test: mkdir then ls shows it
+        tests.append([
+            ("mkdir gal", "<output><eor>"),
+            ("mkdir tov", "<output><eor>"),
+            ("ls", "<output>gal  tov<eor>"),
+        ])
+        # Test: cd into dir, ls empty, cd back, ls still there
+        tests.append([
+            ("mkdir plok", "<output><eor>"),
+            ("cd plok", "<output><eor>"),
+            ("ls", "<output><eor>"),
+            ("cd ..", "<output><eor>"),
+            ("ls", "<output>plok<eor>"),
+        ])
+        # Test: nested mkdir + ls
+        tests.append([
+            ("mkdir dex", "<output><eor>"),
+            ("cd dex", "<output><eor>"),
+            ("mkdir sub", "<output><eor>"),
+            ("mkdir rak", "<output><eor>"),
+            ("ls", "<output>rak  sub<eor>"),
+        ])
+
+    if stage_idx >= 1:  # Stage 2: + pwd
+        tests.append([
+            ("pwd", "<output>/<eor>"),
+            ("mkdir wun", "<output><eor>"),
+            ("cd wun", "<output><eor>"),
+            ("pwd", "<output>/wun<eor>"),
+            ("mkdir deep", "<output><eor>"),
+            ("cd deep", "<output><eor>"),
+            ("pwd", "<output>/wun/deep<eor>"),
+            ("cd ..", "<output><eor>"),
+            ("pwd", "<output>/wun<eor>"),
+        ])
+
+    if stage_idx >= 2:  # Stage 3: + touch
+        tests.append([
+            ("mkdir tdir", "<output><eor>"),
+            ("cd tdir", "<output><eor>"),
+            ("touch fob.txt", "<output><eor>"),
+            ("touch zel", "<output><eor>"),
+            ("ls", "<output>fob.txt  zel<eor>"),
+        ])
+
+    if stage_idx >= 3:  # Stage 4: + echo >
+        tests.append([
+            ("echo hello world > greet.txt", "<output><eor>"),
+            ("ls", "<output>greet.txt<eor>"),
+        ])
+
+    if stage_idx >= 4:  # Stage 5: + cat
+        tests.append([
+            ("echo test data here > myfile", "<output><eor>"),
+            ("cat myfile", "<output>test data here<eor>"),
+        ])
+        # Cat after cd
+        tests.append([
+            ("mkdir cdir", "<output><eor>"),
+            ("cd cdir", "<output><eor>"),
+            ("echo inside dir > inner.txt", "<output><eor>"),
+            ("cat inner.txt", "<output>inside dir<eor>"),
+        ])
+
+    if stage_idx >= 5:  # Stage 6: + echo >>
+        tests.append([
+            ("echo first line > log.txt", "<output><eor>"),
+            ("echo second line >> log.txt", "<output><eor>"),
+            ("cat log.txt", "<output>first line\nsecond line<eor>"),
+        ])
+
+    if stage_idx >= 6:  # Stage 7: + rm
+        tests.append([
+            ("echo data > tmp.dat", "<output><eor>"),
+            ("ls", "<output>tmp.dat<eor>"),
+            ("rm tmp.dat", "<output><eor>"),
+            ("ls", "<output><eor>"),
+        ])
+
+    if stage_idx >= 7:  # Stage 8: + errors
+        tests.append([
+            ("cd nofolder", "<err><eor>"),
+            ("cat nofile.txt", "<err><eor>"),
+            ("mkdir dup", "<output><eor>"),
+            ("mkdir dup", "<err><eor>"),
+        ])
+
+    return tests
+
+
+# ---------------------------------------------------------------------------
 # Evaluation
 # ---------------------------------------------------------------------------
 
@@ -173,8 +281,75 @@ def generate_response(model, prompt_ids: list[int], tokenizer: BashTokenizer,
 
 
 @torch.no_grad()
-def evaluate(model, val_dataset, device, tokenizer=None, num_samples=5, log_fn=None):
-    """Run validation and optionally generate sample outputs."""
+def run_gate_tests(model, stage_idx: int, device, log_fn=None):
+    """Run targeted gate tests for a stage. Returns (passed, results_dict)."""
+    model.eval()
+    tok = BashTokenizer()
+    tests = _build_gate_tests(stage_idx)
+
+    total = 0
+    correct = 0
+    all_samples = []
+
+    for script_idx, script in enumerate(tests):
+        # Build context incrementally — each command adds to history
+        context_ids = []
+
+        for cmd_str, expected_response in script:
+            # Encode command: <prompt>cmd<eoi>
+            cmd_text = f"<prompt>{cmd_str}<eoi>"
+            cmd_ids = tok.encode(cmd_text)
+            context_ids.extend(cmd_ids)
+
+            # Generate model response
+            gen_ids = generate_response(model, context_ids, tok, device)
+            gen_text = tok.decode(gen_ids)
+
+            # Check match
+            match = gen_text == expected_response
+            total += 1
+            if match:
+                correct += 1
+
+            sample = {
+                "command": cmd_str,
+                "expected": expected_response,
+                "generated": gen_text,
+                "match": match,
+            }
+            all_samples.append(sample)
+
+            match_str = "OK" if match else "WRONG"
+            print(f"    [{match_str}] {cmd_str}")
+            print(f"      expected:  {expected_response!r}")
+            print(f"      got:       {gen_text!r}")
+
+            # Add expected response to context (so subsequent commands have correct history)
+            expected_ids = tok.encode(expected_response)
+            context_ids.extend(expected_ids)
+
+    accuracy = correct / total if total > 0 else 0
+    passed = correct == total  # must get ALL right
+
+    print(f"\n    Gate result: {correct}/{total} correct ({accuracy:.0%})")
+    print(f"    {'PASSED' if passed else 'FAILED'}")
+
+    if log_fn:
+        log_fn({"type": "samples", "samples": all_samples,
+                "gate_correct": correct, "gate_total": total})
+
+    model.train()
+    return passed, {
+        "gate_correct": correct,
+        "gate_total": total,
+        "gate_accuracy": round(accuracy, 4),
+        "gate_passed": passed,
+    }
+
+
+@torch.no_grad()
+def evaluate_loss(model, val_dataset, device):
+    """Run validation loss only (no generation)."""
     model.eval()
     total_loss = 0.0
     total_tokens = 0
@@ -193,72 +368,8 @@ def evaluate(model, val_dataset, device, tokenizer=None, num_samples=5, log_fn=N
 
     avg_loss = total_loss / max(total_tokens, 1)
     ppl = math.exp(min(avg_loss, 20))
-
-    # Generate sample outputs from scratch to see what the model actually does
-    samples = []
-    if tokenizer and num_samples > 0:
-        # Build a few test prompts from the validation data
-        val_ids = val_dataset.samples[0]  # raw token ids from first session
-        tok = tokenizer
-
-        # Find prompt positions in the validation data
-        prompt_positions = []
-        for j, tid in enumerate(val_ids):
-            if tid == tok.prompt_id:
-                prompt_positions.append(j)
-
-        # Pick evenly spaced prompts to test
-        if len(prompt_positions) >= num_samples:
-            step = len(prompt_positions) // num_samples
-            test_positions = prompt_positions[::step][:num_samples]
-        else:
-            test_positions = prompt_positions[:num_samples]
-
-        for pos in test_positions:
-            # Context = everything up to and including <eoi>
-            ctx_end = pos
-            for k in range(pos + 1, min(pos + 100, len(val_ids))):
-                ctx_end = k + 1
-                if val_ids[k] == tok.eoi_id:
-                    break
-
-            context = val_ids[:ctx_end]
-            command_text = tok.decode(val_ids[pos:ctx_end])
-
-            # Find expected output (everything from ctx_end until <eor> inclusive)
-            expected_end = ctx_end
-            for k in range(ctx_end, min(ctx_end + 500, len(val_ids))):
-                expected_end = k + 1
-                if val_ids[k] == tok.eor_id:
-                    break
-            expected_text = tok.decode(val_ids[ctx_end:expected_end])
-
-            # Generate model response
-            gen_ids = generate_response(model, context, tok, device)
-            gen_text = tok.decode(gen_ids)
-
-            sample = {
-                "command": command_text.strip(),
-                "expected": expected_text.strip(),
-                "generated": gen_text.strip(),
-                "match": expected_text.strip() == gen_text.strip(),
-            }
-            samples.append(sample)
-
-            # Print to console
-            match_str = "OK" if sample["match"] else "WRONG"
-            print(f"    [{match_str}] {sample['command']}")
-            print(f"      expected:  {sample['expected']!r}")
-            print(f"      got:       {sample['generated']!r}")
-
-        # Log samples
-        if log_fn:
-            log_fn({"type": "samples", "samples": samples})
-
     model.train()
-    return {"val_loss": avg_loss, "val_ppl": ppl, "val_tokens": total_tokens,
-            "num_correct": sum(1 for s in samples if s["match"]),
-            "num_samples": len(samples)}
+    return {"val_loss": avg_loss, "val_ppl": ppl, "val_tokens": total_tokens}
 
 
 # ---------------------------------------------------------------------------
@@ -284,7 +395,6 @@ class CurriculumConfig:
     grad_accum: int = 4
     steps_per_stage: int = 2000       # max steps before forced gate check
     anneal_steps: int = 5000          # longer for final annealing stage
-    gate_threshold: float = 1.5       # val loss must be below this to advance
     gate_check_every: int = 100       # check gate this often
     warmup_steps: int = 100           # per stage
     max_lr: float = 3e-4
@@ -455,19 +565,23 @@ def train_curriculum(cfg: CurriculumConfig):
             # --- Gate check ---
             if stage_step % cfg.gate_check_every == 0:
                 print(f"\n  Gate check at stage step {stage_step}...")
-                tok = BashTokenizer()
-                val_metrics = evaluate(model, val_ds, device,
-                                       tokenizer=tok, num_samples=5, log_fn=log)
+
+                # Also get val loss for monitoring
+                loss_metrics = evaluate_loss(model, val_ds, device)
+
+                # Run targeted tests — must get ALL right to pass
+                gate_passed, gate_metrics = run_gate_tests(
+                    model, stage_idx, device, log_fn=log)
+
                 log({"type": "gate_check", "stage": stage_idx,
                      "stage_step": stage_step, "step": global_step,
-                     **val_metrics})
-                print(f"  val_loss={val_metrics['val_loss']:.4f}  "
-                      f"val_ppl={val_metrics['val_ppl']:.2f}  "
-                      f"threshold={cfg.gate_threshold}")
+                     **loss_metrics, **gate_metrics})
+                print(f"  val_loss={loss_metrics['val_loss']:.4f}  "
+                      f"val_ppl={loss_metrics['val_ppl']:.2f}  "
+                      f"gate={gate_metrics['gate_correct']}/{gate_metrics['gate_total']}")
 
                 if is_anneal:
-                    # Anneal stage: no gate, just log progress and keep going
-                    # Save periodic checkpoints
+                    # Anneal stage: no gate, just log and keep going
                     if stage_step % 1000 == 0:
                         ckpt_path = str(ckpt_dir / f"anneal_step{global_step}.pt")
                         torch.save({
@@ -475,23 +589,21 @@ def train_curriculum(cfg: CurriculumConfig):
                             "stage": stage_idx,
                             "model_state_dict": model.state_dict(),
                             "optimizer_state_dict": optimizer.state_dict(),
-                            "val_metrics": val_metrics,
                             "config": model_config,
                         }, ckpt_path)
                         print(f"  Saved: {ckpt_path}")
                     print()
-                elif val_metrics["val_loss"] < cfg.gate_threshold:
-                    print(f"  GATE PASSED - advancing to next stage")
+                elif gate_passed:
+                    print(f"  GATE PASSED - all tests correct, advancing")
                     passed_gate = True
 
-                    # Save stage checkpoint
                     ckpt_path = str(ckpt_dir / f"stage{stage_idx}_passed.pt")
                     torch.save({
                         "global_step": global_step,
                         "stage": stage_idx,
                         "model_state_dict": model.state_dict(),
                         "optimizer_state_dict": optimizer.state_dict(),
-                        "val_metrics": val_metrics,
+                        "gate_metrics": gate_metrics,
                         "config": model_config,
                     }, ckpt_path)
                     print(f"  Saved: {ckpt_path}\n")
@@ -548,8 +660,7 @@ if __name__ == "__main__":
     parser.add_argument("--seq-len", type=int, default=65536)
     parser.add_argument("--grad-accum", type=int, default=4)
     parser.add_argument("--steps-per-stage", type=int, default=2000)
-    parser.add_argument("--gate-threshold", type=float, default=1.5,
-                        help="Val loss must be below this to advance")
+
     parser.add_argument("--gate-check-every", type=int, default=100)
     parser.add_argument("--warmup-steps", type=int, default=100)
     parser.add_argument("--max-lr", type=float, default=3e-4)
@@ -568,7 +679,7 @@ if __name__ == "__main__":
         seq_len=args.seq_len,
         grad_accum=args.grad_accum,
         steps_per_stage=args.steps_per_stage,
-        gate_threshold=args.gate_threshold,
+
         gate_check_every=args.gate_check_every,
         warmup_steps=args.warmup_steps,
         max_lr=args.max_lr,
