@@ -79,10 +79,10 @@ Once a command is introduced, it stays in the training mix forever.
 
 ## Running
 
-Curriculum training (pre-configured for a 3090):
+Curriculum training (Phase 2, pre-configured for a 3090):
 
 ```bash
-python curriculum.py
+python curriculum.py --min-ops 30 --target-ops 80
 ```
 
 Monitor training:
