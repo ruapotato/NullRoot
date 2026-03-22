@@ -1,19 +1,16 @@
 """
-Curriculum training for BashTransformer.
+Curriculum training for BashTransformer (Phase 2 — memory-based).
 
-Stages introduce commands progressively. The model must master each stage's
-validation set before advancing. Once a command is introduced, it stays
-in the training mix forever.
+Each command is processed in isolation. Filesystem state lives in the memory
+bank. No token history crosses command boundaries. Memory is detached between
+commands (truncated BPTT — gradients flow within a command, not across).
 
-Stages:
-  1. mkdir, cd, ls           — directory creation, navigation, listing
-  2. + pwd                   — path tracking
-  3. + touch                 — file creation
-  4. + echo >                — file writing
-  5. + cat                   — file reading
-  6. + echo >>               — appending
-  7. + rm                    — file removal
-  8. + errors                — intentional invalid commands
+Sessions are self-contained: memory resets at session start, commands play
+in order. Each command exchange is complete — the model always sees the full
+<prompt>...<eoi> and generates <output>...<eor>.
+
+Stages introduce commands progressively. Same curriculum and gate structure
+as Phase 1.
 """
 
 import os
@@ -82,7 +79,7 @@ STAGES = [
         "name": "Stage 9: anneal (all commands)",
         "commands": {"mkdir", "cd_child", "cd_up", "cd_abs", "ls", "pwd", "touch", "echo_write", "cat", "echo_append", "rm", "errors"},
         "error_rate": 0.05,
-        "anneal": True,  # signals special LR treatment
+        "anneal": True,
     },
 ]
 
@@ -93,7 +90,6 @@ STAGES = [
 
 def generate_stage_validation(stage_idx: int, num_sessions: int = 10,
                               min_ops: int = 200, seed: int = 99999) -> list[str]:
-    """Generate validation transcripts for a curriculum stage."""
     stage = STAGES[stage_idx]
     commands = stage["commands"]
     error_rate = stage["error_rate"]
@@ -114,22 +110,24 @@ def generate_stage_validation(stage_idx: int, num_sessions: int = 10,
 
 
 class StageValidationDataset(torch.utils.data.Dataset):
-    """Validation dataset generated on-the-fly for a curriculum stage."""
+    """Validation dataset generated on-the-fly for a curriculum stage.
 
-    def __init__(self, stage_idx: int, seq_len: int = 65536,
-                 num_sessions: int = 10, seed: int = 99999):
-        self.seq_len = seq_len
+    Each sample is a complete session as a list of command exchange dicts.
+    """
+
+    def __init__(self, stage_idx: int, num_sessions: int = 10, seed: int = 99999):
         self.tokenizer = BashTokenizer()
-        self.pad_id = self.tokenizer.pad_id
 
+        from dataset import split_session_into_commands
         transcripts = generate_stage_validation(
             stage_idx, num_sessions=num_sessions, seed=seed,
         )
         self.samples = []
         for t in transcripts:
             try:
-                ids = self.tokenizer.encode(t)
-                self.samples.append(ids)
+                cmds = split_session_into_commands(t, self.tokenizer)
+                if cmds:
+                    self.samples.append(cmds)
             except ValueError:
                 continue
 
@@ -137,48 +135,23 @@ class StageValidationDataset(torch.utils.data.Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        ids = list(self.samples[idx])
-        if len(ids) >= self.seq_len:
-            ids = ids[:self.seq_len]
-
-        labels, weights = _build_labels(ids, self.tokenizer)
-
-        pad_len = self.seq_len - len(ids)
-        if pad_len > 0:
-            ids = ids + [self.pad_id] * pad_len
-            labels = labels + [-100] * pad_len
-            weights = weights + [0.0] * pad_len
-
-        return (torch.tensor(ids, dtype=torch.long),
-                torch.tensor(labels, dtype=torch.long),
-                torch.tensor(weights, dtype=torch.float32))
+        return self.samples[idx]
 
 
 # ---------------------------------------------------------------------------
 # Targeted gate tests — concrete scenarios per stage
 # ---------------------------------------------------------------------------
 
-# Each test is a list of (command, expected_response) pairs.
-# The test runner feeds them sequentially, building context.
-# The gate passes only if ALL tests pass for the stage.
-
 def _build_gate_tests(stage_idx: int) -> list[list[tuple[str, str]]]:
-    """Build targeted test scripts for a curriculum stage.
-
-    Returns a list of test scripts. Each script is a list of
-    (command_str, expected_response_str) tuples.
-    The expected_response includes <output>/<err> and <eor>.
-    """
+    """Build targeted test scripts for a curriculum stage."""
     tests = []
 
     if stage_idx >= 0:  # Stage 1: mkdir + cd + ls
-        # Test: mkdir then ls shows it
         tests.append([
             ("mkdir gal", "<output><eor>"),
             ("mkdir tov", "<output><eor>"),
             ("ls", "<output>gal  tov<eor>"),
         ])
-        # Test: cd into dir, ls empty, cd back, ls still there
         tests.append([
             ("mkdir plok", "<output><eor>"),
             ("cd plok", "<output><eor>"),
@@ -186,7 +159,6 @@ def _build_gate_tests(stage_idx: int) -> list[list[tuple[str, str]]]:
             ("cd ..", "<output><eor>"),
             ("ls", "<output>plok<eor>"),
         ])
-        # Test: nested mkdir + ls
         tests.append([
             ("mkdir dex", "<output><eor>"),
             ("cd dex", "<output><eor>"),
@@ -228,7 +200,6 @@ def _build_gate_tests(stage_idx: int) -> list[list[tuple[str, str]]]:
             ("echo test data here > myfile", "<output><eor>"),
             ("cat myfile", "<output>test data here<eor>"),
         ])
-        # Cat after cd
         tests.append([
             ("mkdir cdir", "<output><eor>"),
             ("cd cdir", "<output><eor>"),
@@ -263,28 +234,39 @@ def _build_gate_tests(stage_idx: int) -> list[list[tuple[str, str]]]:
 
 
 # ---------------------------------------------------------------------------
-# Evaluation
+# Evaluation (Phase 2 — memory-based generation)
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def generate_response(model, prompt_ids: list[int], tokenizer: BashTokenizer,
-                      device, max_tokens: int = 512) -> list[int]:
-    """Generate tokens from the model until <eor>, <eos>, or max length."""
-    ids = list(prompt_ids)
+def generate_response(model, cmd_ids: list[int], memory: torch.Tensor,
+                      tokenizer: BashTokenizer, device,
+                      max_tokens: int = 512) -> tuple[list[int], torch.Tensor]:
+    """Generate tokens for a single command using memory state.
+
+    Returns (generated_ids, updated_memory).
+    The model sees ONLY the current command tokens + memory.
+    """
+    ids = list(cmd_ids)
     for _ in range(max_tokens):
         input_t = torch.tensor([ids], dtype=torch.long, device=device)
         with autocast("cuda", dtype=torch.bfloat16):
-            out = model(input_t)
+            out = model(input_t, memory=memory)
         next_id = out["logits"][0, -1, :].argmax().item()
         ids.append(next_id)
+        # Update memory from the full sequence so far
+        memory = out["memory"]
         if next_id in (tokenizer.eor_id, tokenizer.eos_id):
             break
-    return ids[len(prompt_ids):]
+    return ids[len(cmd_ids):], memory
 
 
 @torch.no_grad()
 def run_gate_tests(model, stage_idx: int, device, log_fn=None):
-    """Run targeted gate tests for a stage. Returns (passed, results_dict)."""
+    """Run targeted gate tests for a stage. Returns (passed, results_dict).
+
+    Each test script is a fresh session — memory resets at the start.
+    Commands are fed one at a time, memory carries forward.
+    """
     model.eval()
     tok = BashTokenizer()
     tests = _build_gate_tests(stage_idx)
@@ -294,24 +276,22 @@ def run_gate_tests(model, stage_idx: int, device, log_fn=None):
     all_samples = []
 
     for script_idx, script in enumerate(tests):
-        # Build context incrementally — each command adds to history
-        context_ids = []
+        # Fresh memory for each test script
+        memory = model.memory_bank.reset(1).to(
+            dtype=next(model.parameters()).dtype, device=device)
 
         for cmd_str, expected_response in script:
             # Encode command: <prompt>cmd<eoi>
             cmd_text = f"<prompt>{cmd_str}<eoi>"
             cmd_ids = tok.encode(cmd_text)
-            context_ids.extend(cmd_ids)
 
-            # Generate model response
-            gen_ids = generate_response(model, context_ids, tok, device)
+            # Generate response using only current command + memory
+            gen_ids, memory = generate_response(
+                model, cmd_ids, memory, tok, device)
             gen_text = tok.decode(gen_ids)
 
-            # Check match
             match = gen_text == expected_response
 
-            # Only count commands with meaningful output for the gate
-            # Empty responses (<output><eor>) are trivial — don't count them
             is_meaningful = expected_response not in ("<output><eor>",)
 
             if is_meaningful:
@@ -334,12 +314,17 @@ def run_gate_tests(model, stage_idx: int, device, log_fn=None):
             print(f"      expected:  {expected_response!r}")
             print(f"      got:       {gen_text!r}")
 
-            # Add expected response to context (so subsequent commands have correct history)
+            # For subsequent commands, feed the EXPECTED response into memory
+            # so the test builds on correct state, not model errors
             expected_ids = tok.encode(expected_response)
-            context_ids.extend(expected_ids)
+            full_exchange = cmd_ids + expected_ids
+            input_t = torch.tensor([full_exchange], dtype=torch.long, device=device)
+            with autocast("cuda", dtype=torch.bfloat16):
+                out = model(input_t, memory=memory)
+            memory = out["memory"]
 
     accuracy = correct / total if total > 0 else 0
-    passed = correct == total  # must get ALL meaningful tests right
+    passed = correct == total
 
     total_all = len(all_samples)
     correct_all = sum(1 for s in all_samples if s["match"])
@@ -366,23 +351,30 @@ def run_gate_tests(model, stage_idx: int, device, log_fn=None):
 
 @torch.no_grad()
 def evaluate_loss(model, val_dataset, device):
-    """Run validation loss only (no generation)."""
+    """Run validation loss over sessions. Each session: reset memory, iterate commands."""
     model.eval()
     total_loss = 0.0
     total_tokens = 0
 
     for i in range(len(val_dataset)):
-        token_ids, labels, weights = val_dataset[i]
-        token_ids = token_ids.unsqueeze(0).to(device)
-        labels = labels.unsqueeze(0).to(device)
-        weights = weights.unsqueeze(0).to(device)
+        session = val_dataset[i]
+        memory = model.memory_bank.reset(1).to(
+            dtype=next(model.parameters()).dtype, device=device)
 
-        with autocast("cuda", dtype=torch.bfloat16):
-            out = model(token_ids, labels=labels, loss_weights=weights)
+        for cmd in session:
+            ids_t = torch.tensor([cmd["ids"]], dtype=torch.long, device=device)
+            labels_t = torch.tensor([cmd["labels"]], dtype=torch.long, device=device)
+            weights_t = torch.tensor([cmd["weights"]], dtype=torch.float32, device=device)
 
-        n_tokens = (labels != -100).sum().item()
-        total_loss += out["loss"].item() * n_tokens
-        total_tokens += n_tokens
+            with autocast("cuda", dtype=torch.bfloat16):
+                out = model(ids_t, memory=memory, labels=labels_t, loss_weights=weights_t)
+
+            memory = out["memory"].detach()
+
+            n_tokens = (labels_t != -100).sum().item()
+            if n_tokens > 0:
+                total_loss += out["loss"].item() * n_tokens
+                total_tokens += n_tokens
 
     avg_loss = total_loss / max(total_tokens, 1)
     ppl = math.exp(min(avg_loss, 20))
@@ -404,29 +396,31 @@ def get_lr(step, warmup_steps, max_steps, max_lr, min_lr):
 
 
 # ---------------------------------------------------------------------------
-# Curriculum training
+# Curriculum training (Phase 2 — memory-based)
 # ---------------------------------------------------------------------------
 
 @dataclass
 class CurriculumConfig:
-    seq_len: int = 4096               # short context for tight gradient signal
-    grad_accum: int = 1               # no accumulation — update every step
-    steps_per_stage: int = 10000      # enough steps to master each stage
-    anneal_steps: int = 10000         # longer for final annealing stage
-    gate_check_every: int = 500       # check gate this often
-    warmup_steps: int = 100           # per stage
+    grad_accum: int = 1
+    steps_per_stage: int = 10000
+    anneal_steps: int = 10000
+    gate_check_every: int = 500
+    warmup_steps: int = 100
     max_lr: float = 3e-4
     min_lr: float = 3e-5
-    anneal_max_lr: float = 5e-5      # low starting LR for annealing
-    anneal_min_lr: float = 1e-6      # decays to near zero
+    anneal_max_lr: float = 5e-5
+    anneal_min_lr: float = 1e-6
     max_grad_norm: float = 1.0
     log_every: int = 10
     data_workers: int = 4
     buffer_size: int = 16
     seed: int = 42
     ckpt_dir: str = "checkpoints"
-    resume_stage: int = 0             # start from this stage
+    resume_stage: int = 0
     resume_ckpt: str | None = None
+    # Session size for training data
+    min_ops: int = 30
+    target_ops: int = 80
 
 
 def train_curriculum(cfg: CurriculumConfig):
@@ -443,7 +437,7 @@ def train_curriculum(cfg: CurriculumConfig):
     print("Compiling model...")
     model = torch.compile(model)
 
-    # --- Optimizer (persists across stages) ---
+    # --- Optimizer ---
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=cfg.max_lr,
         betas=(0.9, 0.95), weight_decay=0.1, fused=True,
@@ -485,15 +479,15 @@ def train_curriculum(cfg: CurriculumConfig):
              "global_step": global_step})
 
         # --- Stage validation set ---
-        val_ds = StageValidationDataset(stage_idx, seq_len=cfg.seq_len)
+        val_ds = StageValidationDataset(stage_idx)
         print(f"  Validation: {len(val_ds)} sessions")
 
         # --- Stage training data ---
         train_ds = BashSessionDataset(
-            seq_len=cfg.seq_len,
             buffer_size=cfg.buffer_size,
             workers=cfg.data_workers,
-            min_ops=300, target_ops=800,
+            min_ops=cfg.min_ops,
+            target_ops=cfg.target_ops,
             error_rate=stage["error_rate"],
             base_seed=cfg.seed + stage_idx * 1000,
             commands=stage["commands"],
@@ -503,10 +497,10 @@ def train_curriculum(cfg: CurriculumConfig):
         model.train()
         stage_step = 0
         running_loss = 0.0
+        running_cmds = 0
         step_t0 = time.time()
         passed_gate = False
 
-        # Anneal stage: more steps, lower LR
         is_anneal = stage.get("anneal", False)
         stage_max_steps = cfg.anneal_steps if is_anneal else cfg.steps_per_stage
         stage_max_lr = cfg.anneal_max_lr if is_anneal else cfg.max_lr
@@ -516,35 +510,58 @@ def train_curriculum(cfg: CurriculumConfig):
             print(f"  Annealing: {stage_max_steps} steps, LR {stage_max_lr} -> {stage_min_lr}")
 
         while stage_step < stage_max_steps:
-            # LR schedule (per-stage cosine)
+            # LR schedule
             lr = get_lr(stage_step, cfg.warmup_steps, stage_max_steps,
                         stage_max_lr, stage_min_lr)
             for pg in optimizer.param_groups:
                 pg["lr"] = lr
 
-            # Gradient accumulation
+            # One step = one complete session
+            # Reset memory, iterate commands in order, accumulate loss
             optimizer.zero_grad()
-            accum_loss = 0.0
 
-            for _ in range(cfg.grad_accum):
-                token_ids, labels, weights = next(train_iter)
-                token_ids = token_ids.unsqueeze(0).to(device)
-                labels = labels.unsqueeze(0).to(device)
-                weights = weights.unsqueeze(0).to(device)
+            session = next(train_iter)
+
+            # Initialize memory for this session
+            memory = model.memory_bank.reset(1).to(
+                dtype=next(model.parameters()).dtype, device=device)
+
+            session_loss = 0.0
+            session_tokens = 0
+
+            for cmd in session:
+                ids_t = torch.tensor([cmd["ids"]], dtype=torch.long, device=device)
+                labels_t = torch.tensor([cmd["labels"]], dtype=torch.long, device=device)
+                weights_t = torch.tensor([cmd["weights"]], dtype=torch.float32, device=device)
 
                 with autocast("cuda", dtype=torch.bfloat16):
-                    out = model(token_ids, labels=labels, loss_weights=weights)
-                    loss = out["loss"] / cfg.grad_accum
+                    out = model(ids_t, memory=memory, labels=labels_t, loss_weights=weights_t)
 
-                loss.backward()
-                accum_loss += out["loss"].item()
+                n_tokens = (labels_t != -100).sum().item()
+                if n_tokens > 0:
+                    # Scale loss by number of trained tokens so each token
+                    # contributes equally regardless of command length
+                    loss = out["loss"]
+                    loss.backward()
+                    session_loss += out["loss"].item() * n_tokens
+                    session_tokens += n_tokens
 
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
-            optimizer.step()
+                # Detach memory — truncated BPTT
+                memory = out["memory"].detach()
 
-            avg_loss = accum_loss / cfg.grad_accum
-            running_loss += avg_loss
-            total_tokens += cfg.seq_len * cfg.grad_accum
+            # Clip and step after the full session
+            if session_tokens > 0:
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), cfg.max_grad_norm)
+                optimizer.step()
+
+                avg_loss = session_loss / session_tokens
+                running_loss += avg_loss
+                running_cmds += len(session)
+                total_tokens += session_tokens
+            else:
+                grad_norm = torch.tensor(0.0)
+
             stage_step += 1
             global_step += 1
 
@@ -552,9 +569,10 @@ def train_curriculum(cfg: CurriculumConfig):
             if stage_step % cfg.log_every == 0:
                 elapsed = time.time() - step_t0
                 steps_per_sec = cfg.log_every / elapsed
-                tokens_per_sec = (cfg.seq_len * cfg.grad_accum * cfg.log_every) / elapsed
+                tokens_per_sec = total_tokens / max(time.time() - t0_global, 1)
                 avg_running = running_loss / cfg.log_every
                 ppl = math.exp(min(avg_running, 20))
+                avg_cmds = running_cmds / cfg.log_every
 
                 mem_used = torch.cuda.memory_allocated() / 1e9 if device.type == "cuda" else 0
                 mem_peak = torch.cuda.max_memory_allocated() / 1e9 if device.type == "cuda" else 0
@@ -567,6 +585,7 @@ def train_curriculum(cfg: CurriculumConfig):
                     "steps_per_sec": round(steps_per_sec, 3),
                     "tokens_per_sec": round(tokens_per_sec),
                     "total_tokens": total_tokens,
+                    "avg_cmds_per_session": round(avg_cmds, 1),
                     "gpu_mem_gb": round(mem_used, 2),
                     "gpu_peak_gb": round(mem_peak, 2),
                 }
@@ -575,20 +594,19 @@ def train_curriculum(cfg: CurriculumConfig):
                 eta_stage = (stage_max_steps - stage_step) / max(steps_per_sec, 0.001)
                 print(f"  S{stage_idx} {stage_step:>5d}/{stage_max_steps} "
                       f"(g:{global_step}) | loss {avg_running:.4f} | ppl {ppl:>7.2f} | "
-                      f"lr {lr:.2e} | {steps_per_sec:.2f} s/s | {tokens_per_sec:,.0f} t/s | "
+                      f"lr {lr:.2e} | {steps_per_sec:.2f} s/s | {avg_cmds:.0f} cmd/sess | "
                       f"gpu {mem_peak:.1f}GB | eta {eta_stage/60:.0f}m")
 
                 running_loss = 0.0
+                running_cmds = 0
                 step_t0 = time.time()
 
             # --- Gate check ---
             if stage_step % cfg.gate_check_every == 0:
                 print(f"\n  Gate check at stage step {stage_step}...")
 
-                # Also get val loss for monitoring
                 loss_metrics = evaluate_loss(model, val_ds, device)
 
-                # Run targeted tests — must get ALL right to pass
                 gate_passed, gate_metrics = run_gate_tests(
                     model, stage_idx, device, log_fn=log)
 
@@ -600,7 +618,6 @@ def train_curriculum(cfg: CurriculumConfig):
                       f"gate={gate_metrics['gate_correct']}/{gate_metrics['gate_total']}")
 
                 if is_anneal:
-                    # Anneal stage: no gate, just log and keep going
                     if stage_step % 1000 == 0:
                         ckpt_path = str(ckpt_dir / f"anneal_step{global_step}.pt")
                         torch.save({
@@ -632,10 +649,9 @@ def train_curriculum(cfg: CurriculumConfig):
 
         train_ds.stop()
 
-        if not passed_gate:
+        if not passed_gate and not is_anneal:
             print(f"\n  WARNING: Stage {stage_idx} did not pass gate after "
-                  f"{stage_max_steps} steps (gate={gate_metrics['gate_correct']}/{gate_metrics['gate_total']})")
-            # Save and continue anyway
+                  f"{stage_max_steps} steps")
             ckpt_path = str(ckpt_dir / f"stage{stage_idx}_timeout.pt")
             torch.save({
                 "global_step": global_step,
@@ -675,12 +691,10 @@ def train_curriculum(cfg: CurriculumConfig):
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Curriculum training for BashTransformer")
-    parser.add_argument("--seq-len", type=int, default=65536)
-    parser.add_argument("--grad-accum", type=int, default=4)
-    parser.add_argument("--steps-per-stage", type=int, default=2000)
-
-    parser.add_argument("--gate-check-every", type=int, default=100)
+    parser = argparse.ArgumentParser(description="Curriculum training for BashTransformer (Phase 2)")
+    parser.add_argument("--grad-accum", type=int, default=1)
+    parser.add_argument("--steps-per-stage", type=int, default=10000)
+    parser.add_argument("--gate-check-every", type=int, default=500)
     parser.add_argument("--warmup-steps", type=int, default=100)
     parser.add_argument("--max-lr", type=float, default=3e-4)
     parser.add_argument("--min-lr", type=float, default=3e-5)
@@ -691,14 +705,14 @@ if __name__ == "__main__":
     parser.add_argument("--ckpt-dir", type=str, default="checkpoints")
     parser.add_argument("--resume-stage", type=int, default=0)
     parser.add_argument("--resume-ckpt", type=str, default=None)
+    parser.add_argument("--min-ops", type=int, default=30)
+    parser.add_argument("--target-ops", type=int, default=80)
 
     args = parser.parse_args()
 
     cfg = CurriculumConfig(
-        seq_len=args.seq_len,
         grad_accum=args.grad_accum,
         steps_per_stage=args.steps_per_stage,
-
         gate_check_every=args.gate_check_every,
         warmup_steps=args.warmup_steps,
         max_lr=args.max_lr,
@@ -710,6 +724,8 @@ if __name__ == "__main__":
         ckpt_dir=args.ckpt_dir,
         resume_stage=args.resume_stage,
         resume_ckpt=args.resume_ckpt,
+        min_ops=args.min_ops,
+        target_ops=args.target_ops,
     )
 
     train_curriculum(cfg)

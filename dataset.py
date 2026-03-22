@@ -1,11 +1,14 @@
 """
 Live-generating PyTorch dataset for bash terminal sessions.
 
-No disk I/O — sessions are generated on the fly in background threads and
-buffered so the GPU never stalls. Every session is unique.
+Phase 2: Commands are served one at a time, not packed into context windows.
+Each session is a self-contained ordered list of command exchanges. Memory
+carries state between commands — there is no token history across commands.
 
-Short sessions are packed end-to-end (separated by <eos>) to fill the
-context window and waste no padding.
+Each command exchange is complete: <prompt>cmd<eoi><output>response<eor>
+The model sees the full command and must generate the response using only
+its current tokens + memory from prior commands. No truncation, no splitting
+exchanges across boundaries.
 """
 
 import threading
@@ -18,21 +21,12 @@ from tokenizer import BashTokenizer
 from generator import SessionGenerator
 
 
-def _build_labels(ids: list[int], tokenizer: BashTokenizer) -> list[int]:
+def _build_labels(ids: list[int], tokenizer: BashTokenizer) -> tuple[list[int], list[float]]:
     """Build labels that only train on output/error responses, not input commands.
 
     Returns (labels, weights):
     - labels: list[int] — token ids or -100 for fully masked positions
     - weights: list[float] — per-token loss weight
-
-    Masking strategy:
-    - <prompt> through <eoi> (inclusive): masked (-100)
-    - Empty responses (<output><eor>): low weight (0.1) — still learned
-      but doesn't dominate gradient
-    - <output> with actual content then <eor>: full weight (1.0)
-    - <err><eor>: full weight (1.0) — error decisions are meaningful
-    - <eos>: full weight (1.0)
-    - <pad>: masked (-100)
     """
     prompt_id = tokenizer.prompt_id
     eoi_id = tokenizer.eoi_id
@@ -45,7 +39,7 @@ def _build_labels(ids: list[int], tokenizer: BashTokenizer) -> list[int]:
     n = len(ids)
     in_prompt = False
 
-    LOW_WEIGHT = 0.1  # weight for empty responses
+    LOW_WEIGHT = 0.1
 
     i = 0
     while i < n:
@@ -61,12 +55,10 @@ def _build_labels(ids: list[int], tokenizer: BashTokenizer) -> list[int]:
             if tok_id == eoi_id:
                 in_prompt = False
         elif tok_id == output_id:
-            # Check if empty response: <output><eor>
             if i + 1 < n and ids[i + 1] == eor_id:
                 weights[i] = LOW_WEIGHT
                 weights[i + 1] = LOW_WEIGHT
                 i += 1
-            # else: content response — keep full weight
         elif tok_id == pad_id:
             labels[i] = -100
             weights[i] = 0.0
@@ -76,21 +68,63 @@ def _build_labels(ids: list[int], tokenizer: BashTokenizer) -> list[int]:
     return labels, weights
 
 
+def split_session_into_commands(transcript: str, tokenizer: BashTokenizer) -> list[dict]:
+    """Split a session transcript into individual command exchanges.
+
+    Each command exchange is a complete unit: <prompt>...<eoi><output>...<eor>
+    or <prompt>...<eoi><err><eor>. Returns a list of dicts, each with:
+      - 'ids': token ids for this complete exchange
+      - 'labels': training labels (-100 for masked positions)
+      - 'weights': per-token loss weights
+
+    The session must be self-contained. Commands are returned in order so
+    memory can carry state forward during training.
+    """
+    # Remove trailing <eos> for splitting, we don't need it per-command
+    text = transcript
+    if text.endswith("<eos>"):
+        text = text[:-5]
+
+    # Split on <prompt> boundaries — each chunk is one command exchange
+    parts = text.split("<prompt>")
+    commands = []
+
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+
+        # Re-add the <prompt> prefix
+        exchange = "<prompt>" + part
+
+        # Verify this is a complete exchange (has <eor>)
+        if "<eor>" not in exchange:
+            continue
+
+        ids = tokenizer.encode(exchange)
+        labels, weights = _build_labels(ids, tokenizer)
+
+        commands.append({
+            "ids": ids,
+            "labels": labels,
+            "weights": weights,
+        })
+
+    return commands
+
+
 class BashSessionDataset(IterableDataset):
-    """Infinite-length IterableDataset that generates sessions on the fly.
+    """Infinite-length dataset yielding complete sessions as command lists.
 
-    Background threads continuously generate and tokenize sessions, packing
-    multiple sessions into each context window when they're short enough.
-    The main thread (dataloader) pulls from the queue, so the GPU never stalls.
+    Each yielded item is a list of command exchanges (dicts with ids/labels/weights).
+    Commands within a session are in order — memory must be carried forward
+    sequentially. Sessions are self-contained: no state leaks between sessions.
 
-    Each sample is a (token_ids, labels) pair of length seq_len.
-    Labels are masked so the model only learns to predict output responses,
-    not input commands. The model handles causal shift internally.
+    Background threads generate sessions continuously so the GPU never stalls.
     """
 
     def __init__(
         self,
-        seq_len: int = 65536,
         buffer_size: int = 32,
         workers: int = 4,
         min_ops: int = 300,
@@ -100,7 +134,6 @@ class BashSessionDataset(IterableDataset):
         commands: set[str] | None = None,
     ):
         super().__init__()
-        self.seq_len = seq_len
         self.buffer_size = buffer_size
         self.workers = workers
         self.min_ops = min_ops
@@ -110,31 +143,22 @@ class BashSessionDataset(IterableDataset):
         self.commands = commands
 
         self.tokenizer = BashTokenizer()
-        self.pad_id = self.tokenizer.pad_id
-        self.eos_id = self.tokenizer.eos_id
 
         self._queue: queue.Queue | None = None
         self._threads: list[threading.Thread] = []
         self._stop_event = threading.Event()
 
     def _worker_loop(self, worker_id: int):
-        """Background worker: generate complete sessions that fit in seq_len."""
+        """Background worker: generate complete sessions split into commands."""
         seed_counter = self.base_seed + worker_id * 10_000_000
         tok = BashTokenizer()
-        pad_id = tok.pad_id
 
         while not self._stop_event.is_set():
             seed_counter += 1
 
-            # Generate a session sized to fit in seq_len
-            # Estimate: ~12 tokens per command, leave room for padding
-            max_ops_for_window = max(10, (self.seq_len - 10) // 12)
-            target = min(self.target_ops, max_ops_for_window)
-            min_o = min(self.min_ops, target)
-
             gen = SessionGenerator(
-                min_ops=min_o,
-                target_ops=target,
+                min_ops=self.min_ops,
+                target_ops=self.target_ops,
                 error_rate=self.error_rate,
                 seed=seed_counter,
                 commands=self.commands,
@@ -142,29 +166,15 @@ class BashSessionDataset(IterableDataset):
             transcript = gen.generate()
 
             try:
-                ids = tok.encode(transcript)
+                cmds = split_session_into_commands(transcript, tok)
             except ValueError:
                 continue
 
-            # Truncate if still too long (shouldn't happen often)
-            if len(ids) > self.seq_len:
-                ids = ids[:self.seq_len]
-
-            labels, weights = _build_labels(ids, tok)
-
-            # Pad to seq_len
-            pad_len = self.seq_len - len(ids)
-            if pad_len > 0:
-                ids = ids + [pad_id] * pad_len
-                labels = labels + [-100] * pad_len
-                weights = weights + [0.0] * pad_len
-
-            token_ids = torch.tensor(ids, dtype=torch.long)
-            labels_t = torch.tensor(labels, dtype=torch.long)
-            weights_t = torch.tensor(weights, dtype=torch.float32)
+            if not cmds:
+                continue
 
             try:
-                self._queue.put((token_ids, labels_t, weights_t), timeout=1.0)
+                self._queue.put(cmds, timeout=1.0)
             except queue.Full:
                 if self._stop_event.is_set():
                     return
@@ -189,23 +199,27 @@ class BashSessionDataset(IterableDataset):
 
     def __iter__(self):
         self._start_workers()
-        while True:
-            try:
-                yield self._queue.get(timeout=10.0)
-            except queue.Empty:
-                continue
+        try:
+            while True:
+                try:
+                    yield self._queue.get(timeout=10.0)
+                except queue.Empty:
+                    continue
+        except GeneratorExit:
+            return
 
     def __del__(self):
         self.stop()
 
 
 class BashValidationDataset(torch.utils.data.Dataset):
-    """Fixed validation dataset loaded from a JSONL file."""
+    """Fixed validation dataset loaded from a JSONL file.
 
-    def __init__(self, path: str, seq_len: int = 65536):
-        self.seq_len = seq_len
+    Each sample is a complete session split into ordered command exchanges.
+    """
+
+    def __init__(self, path: str):
         self.tokenizer = BashTokenizer()
-        self.pad_id = self.tokenizer.pad_id
         self.samples = []
 
         with open(path) as f:
@@ -214,87 +228,80 @@ class BashValidationDataset(torch.utils.data.Dataset):
                 if not line:
                     continue
                 record = json.loads(line)
-                ids = self.tokenizer.encode(record["transcript"])
-                self.samples.append(ids)
+                cmds = split_session_into_commands(record["transcript"], self.tokenizer)
+                if cmds:
+                    self.samples.append(cmds)
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        ids = list(self.samples[idx])
-
-        if len(ids) >= self.seq_len:
-            ids = ids[: self.seq_len]
-
-        labels, weights = _build_labels(ids, self.tokenizer)
-
-        # Pad
-        pad_len = self.seq_len - len(ids)
-        if pad_len > 0:
-            ids = ids + [self.pad_id] * pad_len
-            labels = labels + [-100] * pad_len
-            weights = weights + [0.0] * pad_len
-
-        token_ids = torch.tensor(ids, dtype=torch.long)
-        labels_t = torch.tensor(labels, dtype=torch.long)
-        weights_t = torch.tensor(weights, dtype=torch.float32)
-
-        return token_ids, labels_t, weights_t
+        return self.samples[idx]
 
 
 if __name__ == "__main__":
     import time
 
-    seq_len = 65536
-    print(f"Testing BashSessionDataset (seq_len={seq_len}, packing enabled)...")
-    print(f"  Label masking: only training on output responses, not input commands")
-    ds = BashSessionDataset(seq_len=seq_len, buffer_size=8, workers=4)
+    print("Testing Phase 2 BashSessionDataset (command-by-command)...")
+    ds = BashSessionDataset(buffer_size=8, workers=4, min_ops=10, target_ops=30)
 
     t0 = time.time()
+    total_cmds = 0
     total_tokens = 0
-    total_trained = 0
-    for i, (token_ids, labels) in enumerate(ds):
-        non_pad = (token_ids != ds.pad_id).sum().item()
-        eos_count = (token_ids == ds.eos_id).sum().item()
-        trained = (labels != -100).sum().item()
-        total_tokens += non_pad
-        total_trained += trained
-        if i < 5:
-            print(f"  Sample {i}: {non_pad:,} tokens, "
-                  f"{eos_count} sessions packed, "
-                  f"{trained:,} trained / {non_pad:,} total ({trained/max(non_pad,1)*100:.0f}%)")
-        if i >= 19:
+
+    for i, session in enumerate(ds):
+        n_cmds = len(session)
+        cmd_tokens = [len(cmd["ids"]) for cmd in session]
+        total_cmds += n_cmds
+        total_tokens += sum(cmd_tokens)
+
+        if i < 3:
+            print(f"\n  Session {i}: {n_cmds} commands")
+            for j, cmd in enumerate(session[:5]):
+                tok = BashTokenizer()
+                text = tok.decode(cmd["ids"])
+                trained = sum(1 for l in cmd["labels"] if l != -100)
+                print(f"    Cmd {j}: {len(cmd['ids'])} tokens, {trained} trained | {text[:80]}")
+            if n_cmds > 5:
+                print(f"    ... ({n_cmds - 5} more)")
+
+        if i >= 9:
             break
 
     elapsed = time.time() - t0
     ds.stop()
 
-    print(f"\n  20 samples in {elapsed:.2f}s ({20/elapsed:.1f} samples/s)")
+    print(f"\n  10 sessions in {elapsed:.2f}s")
+    print(f"  Total commands: {total_cmds}")
     print(f"  Total tokens: {total_tokens:,}")
-    print(f"  Trained tokens: {total_trained:,} ({total_trained/total_tokens*100:.0f}%)")
-    print(f"  Utilization: {total_tokens / (20 * seq_len) * 100:.1f}%")
+    print(f"  Avg commands/session: {total_cmds / 10:.0f}")
+    print(f"  Avg tokens/command: {total_tokens / total_cmds:.1f}")
 
-    # Verify masking is correct on a small example
-    print(f"\n  Verifying label masking on small example...")
+    # Verify self-containment: check a session's labels
+    print(f"\n  Verifying command exchange completeness...")
     tok = BashTokenizer()
-    test = "<prompt>mkdir foo\n<output>\n<prompt>cat bar\n<err>\n<eos>"
-    ids = tok.encode(test)
-    labels = _build_labels(ids, tok)
-    print(f"  Input:  {test!r}")
-    for j, (tid, lid) in enumerate(zip(ids, labels)):
-        token_str = tok.decode([tid])
-        trained = "TRAIN" if lid != -100 else "MASK "
-        print(f"    [{j:2d}] {trained} {token_str!r}")
+    test_session = [
+        "<prompt>mkdir foo<eoi><output><eor>",
+        "<prompt>cd foo<eoi><output><eor>",
+        "<prompt>ls<eoi><output><eor>",
+    ]
+    test_transcript = "".join(test_session) + "<eos>"
+    cmds = split_session_into_commands(test_transcript, tok)
+    print(f"  Split into {len(cmds)} commands")
+    for j, cmd in enumerate(cmds):
+        text = tok.decode(cmd["ids"])
+        trained = sum(1 for l in cmd["labels"] if l != -100)
+        masked = sum(1 for l in cmd["labels"] if l == -100)
+        print(f"    [{j}] {text!r}")
+        print(f"         {len(cmd['ids'])} tokens: {trained} trained, {masked} masked")
 
     # Test validation dataset
     import os
     val_path = os.path.join(os.path.dirname(__file__) or ".", "data", "validation.jsonl")
     if os.path.exists(val_path):
         print(f"\nTesting BashValidationDataset from {val_path}...")
-        vds = BashValidationDataset(val_path, seq_len=seq_len)
-        print(f"  {len(vds)} validation samples")
-        tok_t, lab = vds[0]
-        non_pad = (tok_t != vds.pad_id).sum().item()
-        trained = (lab != -100).sum().item()
-        masked = (lab == -100).sum().item()
-        print(f"  Sample 0: {non_pad:,} real tokens, {trained:,} trained, {masked:,} masked")
+        vds = BashValidationDataset(val_path)
+        print(f"  {len(vds)} validation sessions")
+        session0 = vds[0]
+        print(f"  Session 0: {len(session0)} commands")
+        print(f"  First command: {tok.decode(session0[0]['ids'])!r}")

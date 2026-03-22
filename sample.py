@@ -1,18 +1,16 @@
 """
-Interactive inference for BashTransformer.
+Interactive inference for BashTransformer (Phase 2 — memory-based).
 
-Loads a checkpoint, optionally seeds context from a session transcript,
-then accepts user commands and generates responses.
-
-NOTE: During inference, <err> exchanges are stripped from context before
-each forward pass to preserve context length. (Not yet implemented —
-placeholder for future optimization.)
+Each command is processed in isolation. Memory carries filesystem state
+across commands within the session. No token history — only the current
+command tokens and memory are fed to the model.
 """
 
 import argparse
 import sys
 
 import torch
+from torch.amp import autocast
 
 from tokenizer import BashTokenizer
 from model import BashTransformer, BashTransformerConfig
@@ -23,12 +21,11 @@ def load_model(ckpt_path: str, device: torch.device) -> BashTransformer:
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     config = ckpt.get("config", BashTransformerConfig())
     model = BashTransformer(config).to(device).to(torch.bfloat16)
-    # Strip _orig_mod. prefix from torch.compile'd checkpoints
     state_dict = ckpt["model_state_dict"]
     state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
     model.load_state_dict(state_dict)
     model.eval()
-    step = ckpt.get("step", "?")
+    step = ckpt.get("global_step", ckpt.get("step", "?"))
     print(f"Loaded checkpoint from step {step}")
     return model
 
@@ -36,26 +33,30 @@ def load_model(ckpt_path: str, device: torch.device) -> BashTransformer:
 @torch.no_grad()
 def generate(
     model: BashTransformer,
-    token_ids: list[int],
+    cmd_ids: list[int],
+    memory: torch.Tensor,
     tokenizer: BashTokenizer,
     max_new_tokens: int = 4096,
     temperature: float = 0.0,
     device: torch.device = torch.device("cpu"),
-) -> list[int]:
-    """Generate tokens until <eor>, <eos>, or max length.
+) -> tuple[list[int], torch.Tensor]:
+    """Generate tokens for a single command using memory.
 
-    Stops when the model emits <eor> (end of response) or <eos>.
+    Returns (generated_ids, updated_memory).
     """
     eor_id = tokenizer.eor_id
     eos_id = tokenizer.eos_id
 
+    ids = list(cmd_ids)
     generated = []
 
     for _ in range(max_new_tokens):
-        input_ids = torch.tensor([token_ids], dtype=torch.long, device=device)
+        input_ids = torch.tensor([ids], dtype=torch.long, device=device)
 
-        out = model(input_ids)
-        logits = out["logits"][0, -1, :]  # last position
+        with autocast("cuda", dtype=torch.bfloat16):
+            out = model(input_ids, memory=memory)
+        logits = out["logits"][0, -1, :]
+        memory = out["memory"]
 
         if temperature <= 0:
             next_id = logits.argmax().item()
@@ -63,14 +64,13 @@ def generate(
             probs = torch.softmax(logits / temperature, dim=-1)
             next_id = torch.multinomial(probs, 1).item()
 
-        token_ids.append(next_id)
+        ids.append(next_id)
         generated.append(next_id)
 
-        # Stop on <eor> (response done) or <eos> (session done)
         if next_id == eor_id or next_id == eos_id:
             break
 
-    return generated
+    return generated, memory
 
 
 def interactive(args):
@@ -79,29 +79,13 @@ def interactive(args):
     tokenizer = BashTokenizer()
     model = load_model(args.checkpoint, device)
 
-    # Seed context from a transcript file if provided
-    context_ids: list[int] = []
-    if args.context:
-        with open(args.context) as f:
-            import json
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                if line.startswith("{"):
-                    record = json.loads(line)
-                    text = record.get("transcript", line)
-                else:
-                    text = line
-                context_ids = tokenizer.encode(text)
-                break
-        # Strip <eos> from end of context so we can continue
-        if context_ids and context_ids[-1] == tokenizer.eos_id:
-            context_ids = context_ids[:-1]
-        print(f"Loaded context: {len(context_ids)} tokens")
+    # Fresh memory for the session
+    memory = model.memory_bank.reset(1).to(
+        dtype=next(model.parameters()).dtype, device=device)
 
-    print(f"\nBashTransformer interactive mode")
-    print(f"Type bash commands. Ctrl-C or 'exit' to quit.\n")
+    print(f"\nBashTransformer interactive mode (Phase 2 — memory-based)")
+    print(f"Memory: {model.config.num_memory_slots} slots x {model.config.mem_dim} dim")
+    print(f"Type bash commands. 'reset' to clear memory. Ctrl-C or 'exit' to quit.\n")
 
     while True:
         try:
@@ -113,23 +97,35 @@ def interactive(args):
         if cmd.strip() == "exit":
             break
 
+        if cmd.strip() == "reset":
+            memory = model.memory_bank.reset(1).to(
+                dtype=next(model.parameters()).dtype, device=device)
+            print("(memory reset)")
+            continue
+
         # Encode: <prompt>command<eoi>
         cmd_text = f"<prompt>{cmd}<eoi>"
         cmd_ids = tokenizer.encode(cmd_text)
-        context_ids.extend(cmd_ids)
 
-        # Generate response
-        generated = generate(
-            model, context_ids, tokenizer,
+        # Generate response using only this command + memory
+        generated, memory = generate(
+            model, cmd_ids, memory, tokenizer,
             max_new_tokens=args.max_tokens,
             temperature=args.temperature,
             device=device,
         )
 
-        # Decode and display the response (skip the <output>/<err> token itself)
-        response_text = tokenizer.decode(generated)
+        # After generation, update memory with the full exchange
+        # (command + generated response) so future commands see it
+        full_ids = cmd_ids + generated
+        input_t = torch.tensor([full_ids], dtype=torch.long, device=device)
+        with torch.no_grad():
+            with autocast("cuda", dtype=torch.bfloat16):
+                out = model(input_t, memory=memory)
+        memory = out["memory"]
 
-        # Clean up for display
+        # Decode and display
+        response_text = tokenizer.decode(generated)
         display = response_text
         for tag in ["<output>", "<err>", "<eor>", "<prompt>", "<eos>", "<eoi>"]:
             display = display.replace(tag, "")
@@ -140,10 +136,8 @@ def interactive(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Interactive BashTransformer inference")
+    parser = argparse.ArgumentParser(description="Interactive BashTransformer inference (Phase 2)")
     parser.add_argument("checkpoint", help="Path to model checkpoint")
-    parser.add_argument("--context", "-c", type=str, default=None,
-                        help="JSONL file with a session transcript for pre-context")
     parser.add_argument("--max-tokens", type=int, default=4096,
                         help="Max tokens to generate per response")
     parser.add_argument("--temperature", "-t", type=float, default=0.0,
