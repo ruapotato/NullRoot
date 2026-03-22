@@ -409,11 +409,11 @@ def get_lr(step, warmup_steps, max_steps, max_lr, min_lr):
 
 @dataclass
 class CurriculumConfig:
-    seq_len: int = 65536
-    grad_accum: int = 4
-    steps_per_stage: int = 2000       # max steps before forced gate check
-    anneal_steps: int = 5000          # longer for final annealing stage
-    gate_check_every: int = 100       # check gate this often
+    seq_len: int = 4096               # short context for tight gradient signal
+    grad_accum: int = 1               # no accumulation — update every step
+    steps_per_stage: int = 5000       # more steps per stage to compensate
+    anneal_steps: int = 10000         # longer for final annealing stage
+    gate_check_every: int = 250       # check gate this often
     warmup_steps: int = 100           # per stage
     max_lr: float = 3e-4
     min_lr: float = 3e-5
