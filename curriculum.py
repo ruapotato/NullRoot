@@ -411,9 +411,9 @@ def get_lr(step, warmup_steps, max_steps, max_lr, min_lr):
 class CurriculumConfig:
     seq_len: int = 4096               # short context for tight gradient signal
     grad_accum: int = 1               # no accumulation — update every step
-    steps_per_stage: int = 5000       # more steps per stage to compensate
+    steps_per_stage: int = 10000      # enough steps to master each stage
     anneal_steps: int = 10000         # longer for final annealing stage
-    gate_check_every: int = 250       # check gate this often
+    gate_check_every: int = 500       # check gate this often
     warmup_steps: int = 100           # per stage
     max_lr: float = 3e-4
     min_lr: float = 3e-5
@@ -634,7 +634,7 @@ def train_curriculum(cfg: CurriculumConfig):
 
         if not passed_gate:
             print(f"\n  WARNING: Stage {stage_idx} did not pass gate after "
-                  f"{cfg.steps_per_stage} steps (val_loss={val_metrics['val_loss']:.4f})")
+                  f"{stage_max_steps} steps (gate={gate_metrics['gate_correct']}/{gate_metrics['gate_total']})")
             # Save and continue anyway
             ckpt_path = str(ckpt_dir / f"stage{stage_idx}_timeout.pt")
             torch.save({
