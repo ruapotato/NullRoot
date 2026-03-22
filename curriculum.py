@@ -468,7 +468,7 @@ def train_curriculum(cfg: CurriculumConfig):
         log_file.write(json.dumps(entry) + "\n")
         log_file.flush()
 
-    global_step = 0
+    global_step = ckpt.get("global_step", 0) if (cfg.resume_ckpt and os.path.exists(cfg.resume_ckpt)) else 0
     total_tokens = 0
     t0_global = time.time()
 

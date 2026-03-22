@@ -122,4 +122,6 @@ python sample.py checkpoints/final.pt
 
 ## Status
 
-Experimental. Training in progress.
+**Phase 1: Complete.** The model successfully internalized bash filesystem semantics — `mkdir`, `cd`, `ls`, `pwd`, `touch`, `echo >`, `cat` — with correct state tracking across multi-step sessions. Scored 33/35 on the Stage 5 validation gate; the 2 mismatches were attributed to a trailing-space bug in the gate comparator, not model errors.
+
+Phase 2 (in progress): Memory module with severed autoregressive loop — the model will process each command in isolation, maintaining filesystem state through an explicit learned memory bank instead of token history.
