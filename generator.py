@@ -399,12 +399,9 @@ class SessionGenerator:
         self.transcript_parts.append(part)
 
     def _choose_num_ops(self) -> int:
-        # Log-normal: bulk at 500-800, right tail to 5000, floor at min_ops
-        raw = self.rng.lognormvariate(mu=7.6, sigma=0.55)
-        # mu=7.6 -> median ~2000, sigma=0.55 -> p95 ~4900, tail to 5000
-        # ~44% of sessions fill a 65K context window
-        clamped = max(self.min_ops, min(5000, int(raw)))
-        return clamped
+        # Gaussian centered on target_ops with some spread, clamped to [min_ops, 2*target]
+        raw = self.rng.gauss(self.target_ops, self.target_ops * 0.3)
+        return max(self.min_ops, min(self.target_ops * 2, int(raw)))
 
     def _depth(self) -> int:
         """Current directory depth (root=0)."""

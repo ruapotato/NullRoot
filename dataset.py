@@ -118,21 +118,23 @@ class BashSessionDataset(IterableDataset):
         self._stop_event = threading.Event()
 
     def _worker_loop(self, worker_id: int):
-        """Background worker: generate sessions, pack into context windows."""
+        """Background worker: generate complete sessions that fit in seq_len."""
         seed_counter = self.base_seed + worker_id * 10_000_000
         tok = BashTokenizer()
-
-        # Accumulators for packing
-        id_buf: list[int] = []
-        label_buf: list[int] = []
-        weight_buf: list[float] = []
+        pad_id = tok.pad_id
 
         while not self._stop_event.is_set():
             seed_counter += 1
 
+            # Generate a session sized to fit in seq_len
+            # Estimate: ~12 tokens per command, leave room for padding
+            max_ops_for_window = max(10, (self.seq_len - 10) // 12)
+            target = min(self.target_ops, max_ops_for_window)
+            min_o = min(self.min_ops, target)
+
             gen = SessionGenerator(
-                min_ops=self.min_ops,
-                target_ops=self.target_ops,
+                min_ops=min_o,
+                target_ops=target,
                 error_rate=self.error_rate,
                 seed=seed_counter,
                 commands=self.commands,
@@ -144,29 +146,28 @@ class BashSessionDataset(IterableDataset):
             except ValueError:
                 continue
 
+            # Truncate if still too long (shouldn't happen often)
+            if len(ids) > self.seq_len:
+                ids = ids[:self.seq_len]
+
             labels, weights = _build_labels(ids, tok)
-            id_buf.extend(ids)
-            label_buf.extend(labels)
-            weight_buf.extend(weights)
 
-            # Emit full windows as they fill up
-            while len(id_buf) >= self.seq_len:
-                window_ids = id_buf[: self.seq_len]
-                window_labels = label_buf[: self.seq_len]
-                window_weights = weight_buf[: self.seq_len]
-                id_buf = id_buf[self.seq_len :]
-                label_buf = label_buf[self.seq_len :]
-                weight_buf = weight_buf[self.seq_len :]
+            # Pad to seq_len
+            pad_len = self.seq_len - len(ids)
+            if pad_len > 0:
+                ids = ids + [pad_id] * pad_len
+                labels = labels + [-100] * pad_len
+                weights = weights + [0.0] * pad_len
 
-                token_ids = torch.tensor(window_ids, dtype=torch.long)
-                labels_t = torch.tensor(window_labels, dtype=torch.long)
-                weights_t = torch.tensor(window_weights, dtype=torch.float32)
+            token_ids = torch.tensor(ids, dtype=torch.long)
+            labels_t = torch.tensor(labels, dtype=torch.long)
+            weights_t = torch.tensor(weights, dtype=torch.float32)
 
-                try:
-                    self._queue.put((token_ids, labels_t, weights_t), timeout=1.0)
-                except queue.Full:
-                    if self._stop_event.is_set():
-                        return
+            try:
+                self._queue.put((token_ids, labels_t, weights_t), timeout=1.0)
+            except queue.Full:
+                if self._stop_event.is_set():
+                    return
 
     def _start_workers(self):
         if self._queue is not None:
