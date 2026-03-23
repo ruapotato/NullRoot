@@ -37,7 +37,7 @@ from generator import SessionGenerator
 
 STAGES = [
     {
-        "name": "Stage 0: memory warmup (letter recall)",
+        "name": "Stage 0: memory warmup (echo recall)",
         "commands": None,
         "error_rate": 0.0,
         "recall": True,
@@ -129,7 +129,7 @@ class StageValidationDataset(torch.utils.data.Dataset):
         stage = STAGES[stage_idx]
         if stage.get("recall"):
             for i in range(num_sessions):
-                cmds = generate_recall_session(num_cmds=10, seed=seed + i)
+                cmds = generate_recall_session(num_cmds=5, seed=seed + i)
                 if cmds:
                     self.samples.append(cmds)
         else:
@@ -160,7 +160,7 @@ def _build_gate_tests(stage_idx: int) -> list[list[tuple[str, str]]]:
     """Build targeted test scripts for a curriculum stage."""
     tests = []
 
-    if stage_idx == 0:  # Stage 0: word recall
+    if stage_idx == 0:  # Stage 0: echo recall
         tests.append([
             ("gak", "<err>gak<eor>"),
             ("plim", "<err>gak plim<eor>"),
@@ -304,8 +304,7 @@ def run_gate_tests(model, stage_idx: int, device, log_fn=None):
 
     for script_idx, script in enumerate(tests):
         # Fresh memory for each test script
-        memory = model.memory_bank.reset(1).to(
-            dtype=next(model.parameters()).dtype, device=device)
+        memory = model.reset_memory(1, device, next(model.parameters()).dtype)
 
         for cmd_str, expected_response in script:
             # Encode command: <prompt>cmd<eoi>
@@ -385,8 +384,7 @@ def evaluate_loss(model, val_dataset, device):
 
     for i in range(len(val_dataset)):
         session = val_dataset[i]
-        memory = model.memory_bank.reset(1).to(
-            dtype=next(model.parameters()).dtype, device=device)
+        memory = model.reset_memory(1, device, next(model.parameters()).dtype)
 
         for cmd in session:
             ids_t = torch.tensor([cmd["ids"]], dtype=torch.long, device=device)
@@ -498,7 +496,7 @@ def train_curriculum(cfg: CurriculumConfig):
         stage = STAGES[stage_idx]
         print(f"\n{'='*70}")
         print(f"  {stage['name']}")
-        print(f"  Commands: {sorted(stage['commands']) if stage['commands'] else 'N/A (recall)'}")
+        print(f"  Commands: {sorted(stage['commands']) if stage.get('commands') else 'echo recall'}")
         print(f"  Error rate: {stage['error_rate']}")
         print(f"{'='*70}\n")
 
@@ -510,13 +508,12 @@ def train_curriculum(cfg: CurriculumConfig):
         print(f"  Validation: {len(val_ds)} sessions")
 
         # --- Stage training data ---
-        is_recall = stage.get("recall", False)
-        if is_recall:
+        if stage.get("recall"):
             train_ds = RecallDataset(
                 buffer_size=cfg.buffer_size,
                 workers=cfg.data_workers,
                 min_cmds=3,
-                max_cmds=15,
+                max_cmds=8,
                 base_seed=cfg.seed + stage_idx * 1000,
             )
         else:
@@ -560,8 +557,7 @@ def train_curriculum(cfg: CurriculumConfig):
             session = next(train_iter)
 
             # Initialize memory for this session
-            memory = model.memory_bank.reset(1).to(
-                dtype=next(model.parameters()).dtype, device=device)
+            memory = model.reset_memory(1, device, next(model.parameters()).dtype)
 
             session_loss = 0.0
             session_tokens = 0

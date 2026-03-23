@@ -152,7 +152,6 @@ HTML = """<!DOCTYPE html>
 
 <script>
 const STAGE_DEFS = [
-  { name: 'S0', label: 'recall',       cmds: ['memory warmup', 'letter echo'] },
   { name: 'S1', label: 'mkdir+cd+ls',  cmds: ['mkdir', 'cd', 'ls'] },
   { name: 'S2', label: '+pwd',         cmds: ['mkdir', 'cd', 'ls', 'pwd'] },
   { name: 'S3', label: '+touch',       cmds: ['mkdir', 'cd', 'ls', 'pwd', 'touch'] },
@@ -165,7 +164,7 @@ const STAGE_DEFS = [
 ];
 const STAGE_NAMES = STAGE_DEFS.map(s => s.label);
 const STAGE_COLORS = [
-  '#c9d1d9', '#f85149', '#d29922', '#3fb950', '#58a6ff', '#bc8cff', '#f778ba', '#79c0ff', '#ffa657', '#da7b22'
+  '#f85149', '#d29922', '#3fb950', '#58a6ff', '#bc8cff', '#f778ba', '#79c0ff', '#ffa657', '#da7b22'
 ];
 
 const chartOpts = (label, color) => ({
@@ -241,7 +240,7 @@ function update(data) {
   if (stages.length) {
     const latest = stages[stages.length-1];
     stageTitle.textContent = latest.name || ('Stage ' + latest.stage);
-    stageDesc.textContent = 'Stage ' + currentStage + '/10 | ' + passedStages.size + ' gates passed';
+    stageDesc.textContent = 'Stage ' + (currentStage+1) + '/9 | ' + passedStages.size + ' gates passed';
   }
 
   // Stage definitions

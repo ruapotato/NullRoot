@@ -2,10 +2,12 @@
 Transformer language model for bash terminal simulation.
 Trained from scratch — no external dependencies beyond PyTorch.
 
-Phase 2 architecture: each command processed in isolation. Filesystem state
-lives in an explicit learned memory bank (256 slots x 512 dim). Each
-transformer layer reads from and writes to memory via cross-attention heads.
-No token history crosses command boundaries.
+Phase 2 architecture: standard transformer for within-command processing +
+Gated DeltaNet state layer for cross-command memory. The state matrix S
+is a key-value associative memory updated via the delta rule — it can store,
+update, and erase distinct entries without destroying other information.
+
+No token history crosses command boundaries — only the state matrix persists.
 """
 
 from __future__ import annotations
@@ -36,13 +38,17 @@ class BashTransformerConfig:
     rms_norm_eps: float = 1e-6
     tie_embeddings: bool = True
     gradient_checkpointing: bool = False
-    # Memory bank
-    num_memory_slots: int = 256
-    mem_dim: int = 512  # matches hidden_dim
+    # DeltaNet state
+    state_dim: int = 256  # state matrix is (state_heads, head_dim, head_dim)
+    state_heads: int = 8  # parallel state heads
 
     @property
     def head_dim(self) -> int:
         return self.hidden_dim // self.num_heads
+
+    @property
+    def state_head_dim(self) -> int:
+        return self.state_dim // self.state_heads
 
 
 # ---------------------------------------------------------------------------
@@ -67,8 +73,6 @@ class RMSNorm(nn.Module):
 # ---------------------------------------------------------------------------
 
 class RotaryEmbedding(nn.Module):
-    """Precomputes and caches RoPE sin/cos tables."""
-
     def __init__(self, dim: int, max_positions: int = 131072, theta: float = 500000.0):
         super().__init__()
         self.dim = dim
@@ -123,7 +127,7 @@ def apply_rotary_pos_emb(
 
 
 # ---------------------------------------------------------------------------
-# Attention (self-attention over current command tokens only)
+# Attention (standard causal self-attention for within-command processing)
 # ---------------------------------------------------------------------------
 
 class Attention(nn.Module):
@@ -174,106 +178,131 @@ class SwiGLUFFN(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Memory Bank
+# Gated DeltaNet State Layer — cross-command memory
 # ---------------------------------------------------------------------------
 
-class MemoryBank(nn.Module):
-    """Explicit learned memory bank for filesystem state.
+class GatedDeltaState(nn.Module):
+    """Gated DeltaNet state layer for cross-command memory.
 
-    num_slots=256 slots of mem_dim=512. Learned initial state via nn.Parameter.
-    Memory persists across commands within a session, detached between commands
-    for truncated BPTT.
+    Maintains a state matrix S (per head) that acts as key-value associative
+    memory. Updated via the gated delta rule which supports:
+    - Targeted writes: store specific key-value pairs without overwriting others
+    - Selective forgetting: decay gate can erase specific entries
+    - Associative reads: query the state to retrieve stored values
+
+    State shape: (batch, num_heads, head_dim, head_dim)
+
+    Used between commands: the transformer processes command tokens normally,
+    then this layer updates S from the command and reads from S to inject
+    context into the next command.
     """
 
     def __init__(self, config: BashTransformerConfig):
         super().__init__()
-        self.num_slots = config.num_memory_slots
-        self.mem_dim = config.mem_dim
-        # Learned initial state — not zeros
-        self.initial_state = nn.Parameter(
-            torch.randn(config.num_memory_slots, config.mem_dim) * 0.02
+        self.num_heads = config.state_heads
+        self.head_dim = config.state_head_dim
+        self.state_dim = config.state_dim
+
+        # Project from hidden_dim to state space
+        self.W_k = nn.Linear(config.hidden_dim, config.state_dim, bias=False)
+        self.W_v = nn.Linear(config.hidden_dim, config.state_dim, bias=False)
+        self.W_q = nn.Linear(config.hidden_dim, config.state_dim, bias=False)
+
+        # Gates
+        self.W_beta = nn.Linear(config.hidden_dim, config.state_dim)  # update strength
+        self.W_alpha = nn.Linear(config.hidden_dim, config.state_dim)  # decay
+        # Bias alpha toward retaining (init positive = slow decay)
+        nn.init.constant_(self.W_alpha.bias, 2.0)
+
+        # Project state readout back to hidden_dim
+        self.W_out = nn.Linear(config.state_dim, config.hidden_dim, bias=False)
+        self.norm = RMSNorm(config.state_dim)
+        self.gate_proj = nn.Linear(config.hidden_dim, config.state_dim, bias=False)
+
+    def reset_state(self, batch_size: int, device: torch.device,
+                    dtype: torch.dtype) -> torch.Tensor:
+        """Return zero-initialized state: (batch, num_heads, head_dim, head_dim)."""
+        return torch.zeros(
+            batch_size, self.num_heads, self.head_dim, self.head_dim,
+            device=device, dtype=dtype,
         )
-
-    def reset(self, batch_size: int) -> torch.Tensor:
-        """Returns initial memory expanded to (batch, num_slots, mem_dim)."""
-        return self.initial_state.unsqueeze(0).expand(batch_size, -1, -1)
-
-
-# ---------------------------------------------------------------------------
-# Memory Head (one per transformer layer)
-# ---------------------------------------------------------------------------
-
-class MemoryHead(nn.Module):
-    """Read from and write to memory via cross-attention.
-
-    Read: x (command tokens) attends to memory slots — injects state info.
-    Write: memory slots attend to x — updates state from command.
-    Gated write prevents catastrophic overwrites.
-    """
-
-    def __init__(self, config: BashTransformerConfig):
-        super().__init__()
-        self.hidden_dim = config.hidden_dim
-
-        # Read: x attends to memory
-        self.read_norm = RMSNorm(config.hidden_dim, config.rms_norm_eps)
-        self.read_attn = nn.MultiheadAttention(
-            embed_dim=config.hidden_dim,
-            num_heads=config.num_heads,
-            batch_first=True,
-            bias=False,
-        )
-
-        # Write: memory attends to x
-        self.write_norm = RMSNorm(config.hidden_dim, config.rms_norm_eps)
-        self.write_attn = nn.MultiheadAttention(
-            embed_dim=config.mem_dim,
-            num_heads=config.num_heads,
-            batch_first=True,
-            bias=False,
-        )
-        # Gated write: memory = memory + sigmoid(gate) * update
-        self.write_gate = nn.Linear(config.mem_dim, config.mem_dim)
 
     def forward(
         self,
-        x: torch.Tensor,          # (batch, seq, hidden)
-        memory: torch.Tensor,      # (batch, num_slots, mem_dim)
+        hidden_states: torch.Tensor,   # (batch, seq_len, hidden_dim)
+        state: torch.Tensor,           # (batch, num_heads, head_dim, head_dim)
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Returns (updated_x, updated_memory)."""
-        # Read from memory: x attends to memory (residual)
-        x_normed = self.read_norm(x)
-        read_out, _ = self.read_attn(
-            query=x_normed, key=memory, value=memory,
-            need_weights=False,
-        )
-        x = x + read_out
+        """Process a sequence of tokens, updating state and producing readouts.
 
-        # Write to memory: memory attends to x (gated residual)
-        x_normed = self.write_norm(x)
-        write_out, _ = self.write_attn(
-            query=memory, key=x_normed, value=x_normed,
-            need_weights=False,
-        )
-        gate = torch.sigmoid(self.write_gate(write_out))
-        memory = memory + gate * write_out
+        Returns (output, new_state):
+        - output: (batch, seq_len, hidden_dim) — state-informed context
+        - new_state: (batch, num_heads, head_dim, head_dim) — updated state
+        """
+        bsz, seq_len, _ = hidden_states.shape
+        h = self.num_heads
+        d = self.head_dim
 
-        return x, memory
+        # Project to state space: (batch, seq_len, num_heads, head_dim)
+        k = self.W_k(hidden_states).view(bsz, seq_len, h, d)
+        v = self.W_v(hidden_states).view(bsz, seq_len, h, d)
+        q = self.W_q(hidden_states).view(bsz, seq_len, h, d)
+
+        # Gates
+        beta = torch.sigmoid(self.W_beta(hidden_states)).view(bsz, seq_len, h, d)
+        alpha = torch.sigmoid(self.W_alpha(hidden_states)).view(bsz, seq_len, h, d)
+
+        # Normalize keys for stable associative memory
+        k = F.normalize(k, dim=-1)
+
+        # Output gate for mixing state readout with input
+        gate = self.gate_proj(hidden_states)  # (batch, seq_len, state_dim)
+
+        # Process tokens recurrently through state
+        outputs = []
+        S = state  # (batch, num_heads, head_dim, head_dim)
+
+        for t in range(seq_len):
+            k_t = k[:, t]      # (batch, h, d)
+            v_t = v[:, t]      # (batch, h, d)
+            q_t = q[:, t]      # (batch, h, d)
+            beta_t = beta[:, t]  # (batch, h, d)
+            alpha_t = alpha[:, t]  # (batch, h, d)
+
+            # Decay state: S = alpha * S
+            S = S * alpha_t.unsqueeze(-1)  # broadcast over last dim
+
+            # Delta update: S = S + beta * (v - S^T k) k^T
+            # S^T k = prediction for this key
+            pred = torch.einsum("bhij,bhj->bhi", S, k_t)  # (batch, h, d)
+            error = v_t - pred  # (batch, h, d)
+            # Outer product update
+            update = torch.einsum("bhi,bhj->bhij", beta_t * error, k_t)
+            S = S + update
+
+            # Read from state: o = S q
+            readout = torch.einsum("bhij,bhj->bhi", S, q_t)  # (batch, h, d)
+            readout = readout.reshape(bsz, self.state_dim)  # (batch, state_dim)
+            outputs.append(readout)
+
+        # Stack outputs: (batch, seq_len, state_dim)
+        context = torch.stack(outputs, dim=1)
+
+        # Normalize, gate, project back to hidden_dim
+        context = self.norm(context) * F.silu(gate)
+        output = self.W_out(context)
+
+        return output, S
 
 
 # ---------------------------------------------------------------------------
-# Transformer Block (with memory)
+# Transformer Block
 # ---------------------------------------------------------------------------
 
 class TransformerBlock(nn.Module):
     def __init__(self, config: BashTransformerConfig):
         super().__init__()
-        # Memory head (read → ... → write)
-        self.memory_head = MemoryHead(config)
-        # Self attention over current command only
         self.attn_norm = RMSNorm(config.hidden_dim, config.rms_norm_eps)
         self.attn = Attention(config)
-        # FFN
         self.ffn_norm = RMSNorm(config.hidden_dim, config.rms_norm_eps)
         self.ffn = SwiGLUFFN(config)
 
@@ -282,19 +311,14 @@ class TransformerBlock(nn.Module):
         hidden_states: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
-        memory: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        # 1. Read from memory
-        hidden_states, memory = self.memory_head(hidden_states, memory)
-        # 2. Self-attention over current command tokens
+    ) -> torch.Tensor:
         hidden_states = hidden_states + self.attn(self.attn_norm(hidden_states), cos, sin)
-        # 3. FFN
         hidden_states = hidden_states + self.ffn(self.ffn_norm(hidden_states))
-        return hidden_states, memory
+        return hidden_states
 
 
 # ---------------------------------------------------------------------------
-# BashTransformer — full model with memory
+# BashTransformer — transformer + DeltaNet state
 # ---------------------------------------------------------------------------
 
 class BashTransformer(nn.Module):
@@ -312,8 +336,9 @@ class BashTransformer(nn.Module):
             theta=config.rope_theta,
         )
 
-        # Memory bank
-        self.memory_bank = MemoryBank(config)
+        # DeltaNet state layers — one at input (read) and one at output (write)
+        self.state_read = GatedDeltaState(config)
+        self.state_write = GatedDeltaState(config)
 
         # Transformer layers
         self.layers = nn.ModuleList([
@@ -362,8 +387,12 @@ class BashTransformer(nn.Module):
 
     @classmethod
     def from_config(cls) -> "BashTransformer":
-        config = BashTransformerConfig()
-        return cls(config)
+        return cls(BashTransformerConfig())
+
+    def reset_memory(self, batch_size: int, device: torch.device,
+                     dtype: torch.dtype) -> torch.Tensor:
+        """Return zero-initialized state: (batch, num_heads, head_dim, head_dim)."""
+        return self.state_read.reset_state(batch_size, device, dtype)
 
     def forward(
         self,
@@ -375,7 +404,7 @@ class BashTransformer(nn.Module):
         """
         Args:
             input_ids: (batch, seq_len) token IDs for a single command
-            memory: (batch, num_slots, mem_dim) or None (uses initial state)
+            memory: (batch, num_heads, head_dim, head_dim) state matrix, or None
             labels: (batch, seq_len) target IDs, -100 for ignored positions
             loss_weights: (batch, seq_len) per-token loss weights
 
@@ -385,29 +414,35 @@ class BashTransformer(nn.Module):
         bsz, seq_len = input_ids.shape
 
         if memory is None:
-            memory = self.memory_bank.reset(bsz).to(
-                dtype=input_ids.dtype if input_ids.is_floating_point()
-                else self.embed_tokens.weight.dtype,
-                device=input_ids.device,
-            )
+            memory = self.reset_memory(bsz, input_ids.device,
+                                       self.embed_tokens.weight.dtype)
 
         hidden_states = self.embed_tokens(input_ids)
 
+        # Read from state: inject context from previous commands
+        state_context, _ = self.state_read(hidden_states, memory)
+        hidden_states = hidden_states + state_context
+
+        # Get RoPE cos/sin
         cos, sin = self.rotary_emb(hidden_states)
 
+        # Run through transformer layers (standard causal self-attention)
         for layer in self.layers:
             if self._gradient_checkpointing and self.training:
-                hidden_states, memory = checkpoint(
-                    layer, hidden_states, cos, sin, memory,
+                hidden_states = checkpoint(
+                    layer, hidden_states, cos, sin,
                     use_reentrant=False,
                 )
             else:
-                hidden_states, memory = layer(hidden_states, cos, sin, memory)
+                hidden_states = layer(hidden_states, cos, sin)
+
+        # Write to state: update memory from this command's output
+        _, new_memory = self.state_write(hidden_states, memory)
 
         hidden_states = self.norm(hidden_states)
         logits = self.lm_head(hidden_states)
 
-        result: dict[str, torch.Tensor] = {"logits": logits, "memory": memory}
+        result: dict[str, torch.Tensor] = {"logits": logits, "memory": new_memory}
 
         if labels is not None:
             shift_logits = logits[:, :-1, :].contiguous()
@@ -440,10 +475,8 @@ class BashTransformer(nn.Module):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    import sys
-
     print("=" * 60)
-    print("BashTransformer — Architecture Verification (Phase 2)")
+    print("BashTransformer — Architecture Verification (DeltaNet)")
     print("=" * 60)
 
     config = BashTransformerConfig()
@@ -454,8 +487,9 @@ if __name__ == "__main__":
     print(f"  num_heads:           {config.num_heads}")
     print(f"  head_dim:            {config.head_dim}")
     print(f"  ffn_intermediate:    {config.ffn_intermediate}")
-    print(f"  num_memory_slots:    {config.num_memory_slots}")
-    print(f"  mem_dim:             {config.mem_dim}")
+    print(f"  state_dim:           {config.state_dim}")
+    print(f"  state_heads:         {config.state_heads}")
+    print(f"  state_head_dim:      {config.state_head_dim}")
 
     print(f"\nCreating model...")
     model = BashTransformer.from_config()
@@ -465,14 +499,15 @@ if __name__ == "__main__":
     print(f"  Total parameters:         {total:>12,}")
     print(f"  Non-embedding parameters: {model.num_parameters(exclude_embeddings=True):>12,}")
 
-    # Forward pass test — single command
-    print(f"\n{'=' * 60}")
-    print("Forward pass test (single command, seq_len=64)")
-    print("=" * 60)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = model.to(device)
-    dummy_ids = torch.randint(0, config.vocab_size, (2, 64), device=device)
-    dummy_labels = torch.randint(0, config.vocab_size, (2, 64), device=device)
+
+    # Single command forward pass
+    print(f"\n{'=' * 60}")
+    print("Forward pass test (single command, seq_len=32)")
+    print("=" * 60)
+    dummy_ids = torch.randint(0, config.vocab_size, (2, 32), device=device)
+    dummy_labels = torch.randint(0, config.vocab_size, (2, 32), device=device)
 
     with torch.no_grad():
         out = model(dummy_ids, labels=dummy_labels)
@@ -480,41 +515,42 @@ if __name__ == "__main__":
     print(f"  logits shape: {out['logits'].shape}")
     print(f"  memory shape: {out['memory'].shape}")
     print(f"  loss:         {out['loss'].item():.4f}")
-    expected_loss = math.log(config.vocab_size)
-    print(f"  expected loss (random): {expected_loss:.4f}")
 
-    # Multi-command session test — memory carries forward
+    # Multi-command session — state carries forward
     print(f"\n{'=' * 60}")
-    print("Session test (3 commands, memory carried forward)")
+    print("Session test (5 commands, state carried forward)")
     print("=" * 60)
     memory = None
-    for i in range(3):
-        cmd_ids = torch.randint(0, config.vocab_size, (1, 32), device=device)
+    for i in range(5):
+        cmd_ids = torch.randint(0, config.vocab_size, (1, 20), device=device)
         with torch.no_grad():
             out = model(cmd_ids, memory=memory)
         memory = out["memory"]
-        print(f"  Command {i+1}: logits {out['logits'].shape}, memory {memory.shape}")
+        mem_norm = memory.norm().item()
+        print(f"  Command {i+1}: logits {out['logits'].shape}, state norm {mem_norm:.2f}")
 
-    # Gradient checkpointing test
+    # Full BPTT test
     print(f"\n{'=' * 60}")
-    print("Gradient checkpointing + backward test")
+    print("Full BPTT test (3 commands, single backward)")
     print("=" * 60)
     model.enable_gradient_checkpointing()
     model.train()
-    memory = model.memory_bank.reset(1).to(device)
-    cmd1 = torch.randint(0, config.vocab_size, (1, 32), device=device)
-    lbl1 = torch.randint(0, config.vocab_size, (1, 32), device=device)
-    out1 = model(cmd1, memory=memory, labels=lbl1)
-    out1["loss"].backward()
-    print(f"  Forward + backward OK, loss={out1['loss'].item():.4f}")
+    memory = model.reset_memory(1, torch.device(device), model.embed_tokens.weight.dtype)
+    total_loss = None
+    for i in range(3):
+        cmd = torch.randint(0, config.vocab_size, (1, 20), device=device)
+        lbl = torch.randint(0, config.vocab_size, (1, 20), device=device)
+        out = model(cmd, memory=memory, labels=lbl)
+        memory = out["memory"]  # no detach
+        n = (lbl != -100).sum().item()
+        if total_loss is None:
+            total_loss = out["loss"] * n
+        else:
+            total_loss = total_loss + out["loss"] * n
+    total_loss.backward()
+    print(f"  Full BPTT backward OK, loss={total_loss.item():.4f}")
 
-    # Detach and second command
-    memory2 = out1["memory"].detach()
-    cmd2 = torch.randint(0, config.vocab_size, (1, 32), device=device)
-    lbl2 = torch.randint(0, config.vocab_size, (1, 32), device=device)
-    model.zero_grad()
-    out2 = model(cmd2, memory=memory2, labels=lbl2)
-    out2["loss"].backward()
-    print(f"  Second command OK, loss={out2['loss'].item():.4f}")
+    print(f"\n  State matrix: {config.state_heads} heads × {config.state_head_dim}×{config.state_head_dim}")
+    print(f"  = {config.state_heads * config.state_head_dim * config.state_head_dim:,} floats of associative memory")
 
     print(f"\nAll checks passed.")

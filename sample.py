@@ -80,11 +80,10 @@ def interactive(args):
     model = load_model(args.checkpoint, device)
 
     # Fresh memory for the session
-    memory = model.memory_bank.reset(1).to(
-        dtype=next(model.parameters()).dtype, device=device)
+    memory = model.reset_memory(1, device, next(model.parameters()).dtype)
 
     print(f"\nBashTransformer interactive mode (Phase 2 — memory-based)")
-    print(f"Memory: {model.config.num_memory_slots} slots x {model.config.mem_dim} dim")
+    print(f"Memory: DeltaNet state {model.config.state_heads}h x {model.config.state_head_dim}d")
     print(f"Type bash commands. 'reset' to clear memory. Ctrl-C or 'exit' to quit.\n")
 
     while True:
@@ -98,8 +97,7 @@ def interactive(args):
             break
 
         if cmd.strip() == "reset":
-            memory = model.memory_bank.reset(1).to(
-                dtype=next(model.parameters()).dtype, device=device)
+            memory = model.reset_memory(1, device, next(model.parameters()).dtype)
             print("(memory reset)")
             continue
 
