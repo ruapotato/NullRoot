@@ -1,16 +1,12 @@
 """
-Curriculum training for BashTransformer (Phase 2 — memory-based).
+Curriculum training for BashTransformer with state patches.
 
-Each command is processed in isolation. Filesystem state lives in the memory
-bank. No token history crosses command boundaries. Memory is detached between
-commands (truncated BPTT — gradients flow within a command, not across).
+Each command is processed as: [state] <prompt>cmd<eoi> → <output>response<eor> <state>patch<eor>
+The model reads state, processes command, produces response + state patch.
+Patch is applied to produce state for next command.
 
-Sessions are self-contained: memory resets at session start, commands play
-in order. Each command exchange is complete — the model always sees the full
-<prompt>...<eoi> and generates <output>...<eor>.
-
-Stages introduce commands progressively. Same curriculum and gate structure
-as Phase 1.
+Pure autoregressive — no memory modules. The state IS the memory,
+expressed as tokens the model reads and writes.
 """
 
 import os
@@ -26,9 +22,8 @@ from torch.amp import autocast
 
 from tokenizer import BashTokenizer
 from model import BashTransformer, BashTransformerConfig
-from dataset import (BashSessionDataset, BashValidationDataset, RecallDataset,
-                     generate_recall_session, _build_labels)
-from generator import SessionGenerator
+from dataset import BashSessionDataset, build_session_samples
+from generator import SessionGenerator, FileSystem
 
 
 # ---------------------------------------------------------------------------
@@ -36,12 +31,6 @@ from generator import SessionGenerator
 # ---------------------------------------------------------------------------
 
 STAGES = [
-    {
-        "name": "Stage 0: memory warmup (echo recall)",
-        "commands": None,
-        "error_rate": 0.0,
-        "recall": True,
-    },
     {
         "name": "Stage 1: mkdir + cd + ls",
         "commands": {"mkdir", "cd_child", "cd_up", "cd_abs", "ls"},
@@ -82,98 +71,17 @@ STAGES = [
         "commands": {"mkdir", "cd_child", "cd_up", "cd_abs", "ls", "pwd", "touch", "echo_write", "cat", "echo_append", "rm", "errors"},
         "error_rate": 0.05,
     },
-    {
-        "name": "Stage 9: anneal (all commands)",
-        "commands": {"mkdir", "cd_child", "cd_up", "cd_abs", "ls", "pwd", "touch", "echo_write", "cat", "echo_append", "rm", "errors"},
-        "error_rate": 0.05,
-        "anneal": True,
-    },
 ]
 
 
 # ---------------------------------------------------------------------------
-# Validation set generation for each stage
+# Gate tests
 # ---------------------------------------------------------------------------
 
-def generate_stage_validation(stage_idx: int, num_sessions: int = 10,
-                              min_ops: int = 200, seed: int = 99999) -> list[str]:
-    stage = STAGES[stage_idx]
-    commands = stage["commands"]
-    error_rate = stage["error_rate"]
-    transcripts = []
-
-    for i in range(num_sessions):
-        gen = SessionGenerator(
-            min_ops=min_ops,
-            target_ops=300,
-            error_rate=error_rate,
-            seed=seed + i,
-            commands=commands,
-        )
-        transcript = gen.generate()
-        transcripts.append(transcript)
-
-    return transcripts
-
-
-class StageValidationDataset(torch.utils.data.Dataset):
-    """Validation dataset generated on-the-fly for a curriculum stage.
-
-    Each sample is a complete session as a list of command exchange dicts.
-    """
-
-    def __init__(self, stage_idx: int, num_sessions: int = 10, seed: int = 99999):
-        self.tokenizer = BashTokenizer()
-        self.samples = []
-
-        stage = STAGES[stage_idx]
-        if stage.get("recall"):
-            for i in range(num_sessions):
-                cmds = generate_recall_session(num_cmds=5, seed=seed + i)
-                if cmds:
-                    self.samples.append(cmds)
-        else:
-            from dataset import split_session_into_commands
-            transcripts = generate_stage_validation(
-                stage_idx, num_sessions=num_sessions, seed=seed,
-            )
-            for t in transcripts:
-                try:
-                    cmds = split_session_into_commands(t, self.tokenizer)
-                    if cmds:
-                        self.samples.append(cmds)
-                except ValueError:
-                    continue
-
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, idx):
-        return self.samples[idx]
-
-
-# ---------------------------------------------------------------------------
-# Targeted gate tests — concrete scenarios per stage
-# ---------------------------------------------------------------------------
-
-def _build_gate_tests(stage_idx: int) -> list[list[tuple[str, str]]]:
-    """Build targeted test scripts for a curriculum stage."""
+def _build_gate_tests(stage_idx):
     tests = []
 
-    if stage_idx == 0:  # Stage 0: echo recall
-        tests.append([
-            ("gak", "<err>gak<eor>"),
-            ("plim", "<err>gak plim<eor>"),
-            ("tov", "<err>gak plim tov<eor>"),
-        ])
-        tests.append([
-            ("brel", "<err>brel<eor>"),
-            ("shuf", "<err>brel shuf<eor>"),
-            ("dox", "<err>brel shuf dox<eor>"),
-        ])
-        return tests
-
-    if stage_idx >= 1:  # Stage 1: mkdir + cd + ls
+    if stage_idx >= 0:
         tests.append([
             ("mkdir gal", "<output><eor>"),
             ("mkdir tov", "<output><eor>"),
@@ -194,20 +102,15 @@ def _build_gate_tests(stage_idx: int) -> list[list[tuple[str, str]]]:
             ("ls", "<output>rak  sub<eor>"),
         ])
 
-    if stage_idx >= 2:  # Stage 2: + pwd
+    if stage_idx >= 1:
         tests.append([
             ("pwd", "<output>/<eor>"),
             ("mkdir wun", "<output><eor>"),
             ("cd wun", "<output><eor>"),
             ("pwd", "<output>/wun<eor>"),
-            ("mkdir deep", "<output><eor>"),
-            ("cd deep", "<output><eor>"),
-            ("pwd", "<output>/wun/deep<eor>"),
-            ("cd ..", "<output><eor>"),
-            ("pwd", "<output>/wun<eor>"),
         ])
 
-    if stage_idx >= 3:  # Stage 3: + touch
+    if stage_idx >= 2:
         tests.append([
             ("mkdir tdir", "<output><eor>"),
             ("cd tdir", "<output><eor>"),
@@ -216,32 +119,26 @@ def _build_gate_tests(stage_idx: int) -> list[list[tuple[str, str]]]:
             ("ls", "<output>fob.txt  zel<eor>"),
         ])
 
-    if stage_idx >= 4:  # Stage 4: + echo >
+    if stage_idx >= 3:
         tests.append([
             ("echo hello world > greet.txt", "<output><eor>"),
             ("ls", "<output>greet.txt<eor>"),
         ])
 
-    if stage_idx >= 5:  # Stage 5: + cat
+    if stage_idx >= 4:
         tests.append([
             ("echo test data here > myfile", "<output><eor>"),
             ("cat myfile", "<output>test data here<eor>"),
         ])
-        tests.append([
-            ("mkdir cdir", "<output><eor>"),
-            ("cd cdir", "<output><eor>"),
-            ("echo inside dir > inner.txt", "<output><eor>"),
-            ("cat inner.txt", "<output>inside dir<eor>"),
-        ])
 
-    if stage_idx >= 6:  # Stage 6: + echo >>
+    if stage_idx >= 5:
         tests.append([
             ("echo first line > log.txt", "<output><eor>"),
             ("echo second line >> log.txt", "<output><eor>"),
             ("cat log.txt", "<output>first line\nsecond line<eor>"),
         ])
 
-    if stage_idx >= 7:  # Stage 7: + rm
+    if stage_idx >= 6:
         tests.append([
             ("echo data > tmp.dat", "<output><eor>"),
             ("ls", "<output>tmp.dat<eor>"),
@@ -249,7 +146,7 @@ def _build_gate_tests(stage_idx: int) -> list[list[tuple[str, str]]]:
             ("ls", "<output><eor>"),
         ])
 
-    if stage_idx >= 8:  # Stage 8: + errors
+    if stage_idx >= 7:
         tests.append([
             ("cd nofolder", "<err><eor>"),
             ("cat nofile.txt", "<err><eor>"),
@@ -261,39 +158,29 @@ def _build_gate_tests(stage_idx: int) -> list[list[tuple[str, str]]]:
 
 
 # ---------------------------------------------------------------------------
-# Evaluation (Phase 2 — memory-based generation)
+# Evaluation
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def generate_response(model, cmd_ids: list[int], memory: torch.Tensor,
-                      tokenizer: BashTokenizer, device,
-                      max_tokens: int = 512) -> tuple[list[int], torch.Tensor]:
-    """Generate tokens for a single command using memory state.
-
-    Returns (generated_ids, updated_memory).
-    The model sees ONLY the current command tokens + memory.
-    """
-    ids = list(cmd_ids)
+def generate_response(model, context_ids, tokenizer, device, max_tokens=512):
+    """Generate until <eor> or <nop>."""
+    ids = list(context_ids)
+    generated = []
     for _ in range(max_tokens):
         input_t = torch.tensor([ids], dtype=torch.long, device=device)
         with autocast("cuda", dtype=torch.bfloat16):
-            out = model(input_t, memory=memory)
+            out = model(input_t)
         next_id = out["logits"][0, -1, :].argmax().item()
         ids.append(next_id)
-        # Update memory from the full sequence so far
-        memory = out["memory"]
-        if next_id in (tokenizer.eor_id, tokenizer.eos_id):
+        generated.append(next_id)
+        if next_id in (tokenizer.eor_id, tokenizer.eos_id, tokenizer.nop_id):
             break
-    return ids[len(cmd_ids):], memory
+    return generated
 
 
 @torch.no_grad()
-def run_gate_tests(model, stage_idx: int, device, log_fn=None):
-    """Run targeted gate tests for a stage. Returns (passed, results_dict).
-
-    Each test script is a fresh session — memory resets at the start.
-    Commands are fed one at a time, memory carries forward.
-    """
+def run_gate_tests(model, stage_idx, device, log_fn=None):
+    """Run gate tests with state tracking."""
     model.eval()
     tok = BashTokenizer()
     tests = _build_gate_tests(stage_idx)
@@ -302,22 +189,30 @@ def run_gate_tests(model, stage_idx: int, device, log_fn=None):
     correct = 0
     all_samples = []
 
-    for script_idx, script in enumerate(tests):
-        # Fresh memory for each test script
-        memory = model.reset_memory(1, device, next(model.parameters()).dtype)
+    for script in tests:
+        state_str = ""
+        fs = FileSystem()
 
         for cmd_str, expected_response in script:
-            # Encode command: <prompt>cmd<eoi>
-            cmd_text = f"<prompt>{cmd_str}<eoi>"
-            cmd_ids = tok.encode(cmd_text)
+            # Build input: [state]<prompt>cmd<eoi>
+            input_text = ""
+            if state_str:
+                input_text += f"<state>{state_str}<eor>"
+            input_text += f"<prompt>{cmd_str}<eoi>"
+            context_ids = tok.encode(input_text)
 
-            # Generate response using only current command + memory
-            gen_ids, memory = generate_response(
-                model, cmd_ids, memory, tok, device)
+            # Generate response (stop at <eor>)
+            gen_ids = generate_response(model, context_ids, tok, device)
             gen_text = tok.decode(gen_ids)
 
-            match = gen_text == expected_response
+            # Extract just the response part (before <state> or <nop>)
+            response_text = gen_text
+            if "<state>" in response_text:
+                response_text = response_text[:response_text.index("<state>")]
+            if "<nop>" in response_text:
+                response_text = response_text[:response_text.index("<nop>")]
 
+            match = response_text == expected_response
             is_meaningful = expected_response not in ("<output><eor>",)
 
             if is_meaningful:
@@ -328,7 +223,7 @@ def run_gate_tests(model, stage_idx: int, device, log_fn=None):
             sample = {
                 "command": cmd_str,
                 "expected": expected_response,
-                "generated": gen_text,
+                "generated": response_text,
                 "match": match,
                 "meaningful": is_meaningful,
             }
@@ -338,73 +233,59 @@ def run_gate_tests(model, stage_idx: int, device, log_fn=None):
             match_str = "OK" if match else "WRONG"
             print(f"    [{match_str}] [{tag}] {cmd_str}")
             print(f"      expected:  {expected_response!r}")
-            print(f"      got:       {gen_text!r}")
+            print(f"      got:       {response_text!r}")
 
-            # For subsequent commands, feed the EXPECTED response into memory
-            # so the test builds on correct state, not model errors
-            expected_ids = tok.encode(expected_response)
-            full_exchange = cmd_ids + expected_ids
-            input_t = torch.tensor([full_exchange], dtype=torch.long, device=device)
-            with autocast("cuda", dtype=torch.bfloat16):
-                out = model(input_t, memory=memory)
-            memory = out["memory"]
+            # Execute command on real filesystem for state tracking
+            _execute_cmd_on_fs(fs, cmd_str)
+            state_str = fs.serialize_state()
 
     accuracy = correct / total if total > 0 else 0
     passed = correct == total
 
-    total_all = len(all_samples)
-    correct_all = sum(1 for s in all_samples if s["match"])
-
-    print(f"\n    Gate tests (meaningful only): {correct}/{total} ({accuracy:.0%})")
-    print(f"    All tests: {correct_all}/{total_all}")
-    print(f"    {'PASSED' if passed else 'FAILED'}")
+    print(f"\n    Gate: {correct}/{total} ({accuracy:.0%}) {'PASSED' if passed else 'FAILED'}")
 
     if log_fn:
         log_fn({"type": "samples", "samples": all_samples,
                 "gate_correct": correct, "gate_total": total,
-                "all_correct": correct_all, "all_total": total_all})
+                "all_correct": sum(1 for s in all_samples if s["match"]),
+                "all_total": len(all_samples)})
 
     model.train()
-    return passed, {
-        "gate_correct": correct,
-        "gate_total": total,
-        "gate_accuracy": round(accuracy, 4),
-        "gate_passed": passed,
-        "all_correct": correct_all,
-        "all_total": total_all,
-    }
+    return passed, {"gate_correct": correct, "gate_total": total,
+                     "gate_accuracy": round(accuracy, 4), "gate_passed": passed,
+                     "all_correct": sum(1 for s in all_samples if s["match"]),
+                     "all_total": len(all_samples)}
 
 
-@torch.no_grad()
-def evaluate_loss(model, val_dataset, device):
-    """Run validation loss over sessions. Each session: reset memory, iterate commands."""
-    model.eval()
-    total_loss = 0.0
-    total_tokens = 0
-
-    for i in range(len(val_dataset)):
-        session = val_dataset[i]
-        memory = model.reset_memory(1, device, next(model.parameters()).dtype)
-
-        for cmd in session:
-            ids_t = torch.tensor([cmd["ids"]], dtype=torch.long, device=device)
-            labels_t = torch.tensor([cmd["labels"]], dtype=torch.long, device=device)
-            weights_t = torch.tensor([cmd["weights"]], dtype=torch.float32, device=device)
-
-            with autocast("cuda", dtype=torch.bfloat16):
-                out = model(ids_t, memory=memory, labels=labels_t, loss_weights=weights_t)
-
-            memory = out["memory"].detach()
-
-            n_tokens = (labels_t != -100).sum().item()
-            if n_tokens > 0:
-                total_loss += out["loss"].item() * n_tokens
-                total_tokens += n_tokens
-
-    avg_loss = total_loss / max(total_tokens, 1)
-    ppl = math.exp(min(avg_loss, 20))
-    model.train()
-    return {"val_loss": avg_loss, "val_ppl": ppl, "val_tokens": total_tokens}
+def _execute_cmd_on_fs(fs, cmd_str):
+    """Execute a command string on a FileSystem (for state tracking in tests)."""
+    parts = cmd_str.split()
+    if not parts:
+        return
+    cmd = parts[0]
+    if cmd == "mkdir" and len(parts) > 1:
+        fs.mkdir(parts[1])
+    elif cmd == "cd" and len(parts) > 1:
+        fs.cd(parts[1])
+    elif cmd == "touch" and len(parts) > 1:
+        fs.touch(parts[1])
+    elif cmd == "ls" or cmd == "pwd":
+        pass  # read-only
+    elif cmd == "echo" and ">" in parts:
+        if ">>" in parts:
+            idx = parts.index(">>")
+            content = " ".join(parts[1:idx])
+            fname = parts[idx + 1]
+            fs.append_file(fname, content)
+        else:
+            idx = parts.index(">")
+            content = " ".join(parts[1:idx])
+            fname = parts[idx + 1]
+            fs.write_file(fname, content)
+    elif cmd == "cat":
+        pass  # read-only
+    elif cmd == "rm" and len(parts) > 1:
+        fs.rm(parts[1])
 
 
 # ---------------------------------------------------------------------------
@@ -421,31 +302,26 @@ def get_lr(step, warmup_steps, max_steps, max_lr, min_lr):
 
 
 # ---------------------------------------------------------------------------
-# Curriculum training (Phase 2 — memory-based)
+# Training
 # ---------------------------------------------------------------------------
 
 @dataclass
 class CurriculumConfig:
-    grad_accum: int = 1
-    steps_per_stage: int = 10000
-    anneal_steps: int = 10000
-    gate_check_every: int = 500
     warmup_steps: int = 100
     max_lr: float = 3e-4
     min_lr: float = 3e-5
-    anneal_max_lr: float = 5e-5
-    anneal_min_lr: float = 1e-6
     max_grad_norm: float = 1.0
     log_every: int = 10
+    gate_check_every: int = 500
+    steps_per_stage: int = 50000  # for LR schedule only
     data_workers: int = 4
     buffer_size: int = 16
     seed: int = 42
     ckpt_dir: str = "checkpoints"
     resume_stage: int = 0
     resume_ckpt: str | None = None
-    # Session size for training data
-    min_ops: int = 30
-    target_ops: int = 80
+    min_ops: int = 10
+    target_ops: int = 30
 
 
 def train_curriculum(cfg: CurriculumConfig):
@@ -453,22 +329,19 @@ def train_curriculum(cfg: CurriculumConfig):
     print(f"Device: {device}")
     if device.type == "cuda":
         print(f"GPU: {torch.cuda.get_device_name()}")
-        print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
 
-    # --- Model ---
     model_config = BashTransformerConfig(gradient_checkpointing=True)
     model = BashTransformer(model_config).to(device).to(torch.bfloat16)
 
     print("Compiling model...")
     model = torch.compile(model)
 
-    # --- Optimizer ---
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=cfg.max_lr,
         betas=(0.9, 0.95), weight_decay=0.1, fused=True,
     )
 
-    # --- Resume ---
+    # Resume
     if cfg.resume_ckpt and os.path.exists(cfg.resume_ckpt):
         print(f"Resuming from {cfg.resume_ckpt}...")
         ckpt = torch.load(cfg.resume_ckpt, map_location=device, weights_only=False)
@@ -476,7 +349,6 @@ def train_curriculum(cfg: CurriculumConfig):
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         print(f"Loaded checkpoint at global step {ckpt.get('global_step', '?')}")
 
-    # --- Log ---
     ckpt_dir = Path(cfg.ckpt_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     log_path = ckpt_dir / "train_log.jsonl"
@@ -491,41 +363,25 @@ def train_curriculum(cfg: CurriculumConfig):
     total_tokens = 0
     t0_global = time.time()
 
-    # --- Stage loop ---
     for stage_idx in range(cfg.resume_stage, len(STAGES)):
         stage = STAGES[stage_idx]
         print(f"\n{'='*70}")
         print(f"  {stage['name']}")
-        print(f"  Commands: {sorted(stage['commands']) if stage.get('commands') else 'echo recall'}")
-        print(f"  Error rate: {stage['error_rate']}")
+        print(f"  Commands: {sorted(stage['commands'])}")
         print(f"{'='*70}\n")
 
         log({"type": "stage_start", "stage": stage_idx, "name": stage["name"],
              "global_step": global_step})
 
-        # --- Stage validation set ---
-        val_ds = StageValidationDataset(stage_idx)
-        print(f"  Validation: {len(val_ds)} sessions")
-
-        # --- Stage training data ---
-        if stage.get("recall"):
-            train_ds = RecallDataset(
-                buffer_size=cfg.buffer_size,
-                workers=cfg.data_workers,
-                min_cmds=3,
-                max_cmds=8,
-                base_seed=cfg.seed + stage_idx * 1000,
-            )
-        else:
-            train_ds = BashSessionDataset(
-                buffer_size=cfg.buffer_size,
-                workers=cfg.data_workers,
-                min_ops=cfg.min_ops,
-                target_ops=cfg.target_ops,
-                error_rate=stage["error_rate"],
-                base_seed=cfg.seed + stage_idx * 1000,
-                commands=stage["commands"],
-            )
+        train_ds = BashSessionDataset(
+            buffer_size=cfg.buffer_size,
+            workers=cfg.data_workers,
+            min_ops=cfg.min_ops,
+            target_ops=cfg.target_ops,
+            error_rate=stage["error_rate"],
+            base_seed=cfg.seed + stage_idx * 1000,
+            commands=stage["commands"],
+        )
         train_iter = iter(train_ds)
 
         model.train()
@@ -535,65 +391,38 @@ def train_curriculum(cfg: CurriculumConfig):
         step_t0 = time.time()
         passed_gate = False
 
-        is_anneal = stage.get("anneal", False)
-        stage_max_steps = cfg.anneal_steps if is_anneal else cfg.steps_per_stage
-        stage_max_lr = cfg.anneal_max_lr if is_anneal else cfg.max_lr
-        stage_min_lr = cfg.anneal_min_lr if is_anneal else cfg.min_lr
-
-        if is_anneal:
-            print(f"  Annealing: {stage_max_steps} steps, LR {stage_max_lr} -> {stage_min_lr}")
-
-        while not passed_gate and not (is_anneal and stage_step >= stage_max_steps):
-            # LR schedule
-            lr = get_lr(stage_step, cfg.warmup_steps, stage_max_steps,
-                        stage_max_lr, stage_min_lr)
+        while not passed_gate:
+            lr = get_lr(stage_step, cfg.warmup_steps, cfg.steps_per_stage,
+                        cfg.max_lr, cfg.min_lr)
             for pg in optimizer.param_groups:
                 pg["lr"] = lr
 
-            # One step = one complete session
-            # Reset memory, iterate commands in order, accumulate loss
             optimizer.zero_grad()
 
             session = next(train_iter)
-
-            # Initialize memory for this session
-            memory = model.reset_memory(1, device, next(model.parameters()).dtype)
-
             session_loss = 0.0
             session_tokens = 0
-            accumulated_loss = None
 
+            # Each command in session is an independent autoregressive sample
             for cmd in session:
                 ids_t = torch.tensor([cmd["ids"]], dtype=torch.long, device=device)
                 labels_t = torch.tensor([cmd["labels"]], dtype=torch.long, device=device)
                 weights_t = torch.tensor([cmd["weights"]], dtype=torch.float32, device=device)
 
                 with autocast("cuda", dtype=torch.bfloat16):
-                    out = model(ids_t, memory=memory, labels=labels_t, loss_weights=weights_t)
+                    out = model(ids_t, labels=labels_t, loss_weights=weights_t)
 
                 n_tokens = (labels_t != -100).sum().item()
                 if n_tokens > 0:
-                    # Accumulate loss — don't backward yet so gradients
-                    # flow through the full memory chain (full BPTT)
-                    if accumulated_loss is None:
-                        accumulated_loss = out["loss"] * n_tokens
-                    else:
-                        accumulated_loss = accumulated_loss + out["loss"] * n_tokens
+                    out["loss"].backward()
                     session_loss += out["loss"].item() * n_tokens
                     session_tokens += n_tokens
 
-                # No detach — full BPTT through entire session
-                memory = out["memory"]
-
-            # Single backward through the full computation graph
-            if session_tokens > 0 and accumulated_loss is not None:
-                (accumulated_loss / session_tokens).backward()
+            if session_tokens > 0:
                 grad_norm = torch.nn.utils.clip_grad_norm_(
                     model.parameters(), cfg.max_grad_norm)
                 optimizer.step()
-
-                avg_loss = session_loss / session_tokens
-                running_loss += avg_loss
+                running_loss += session_loss / session_tokens
                 running_cmds += len(session)
                 total_tokens += session_tokens
             else:
@@ -602,59 +431,41 @@ def train_curriculum(cfg: CurriculumConfig):
             stage_step += 1
             global_step += 1
 
-            # --- Logging ---
             if stage_step % cfg.log_every == 0:
                 elapsed = time.time() - step_t0
                 steps_per_sec = cfg.log_every / elapsed
-                tokens_per_sec = total_tokens / max(time.time() - t0_global, 1)
                 avg_running = running_loss / cfg.log_every
                 ppl = math.exp(min(avg_running, 20))
                 avg_cmds = running_cmds / cfg.log_every
-
-                mem_used = torch.cuda.memory_allocated() / 1e9 if device.type == "cuda" else 0
                 mem_peak = torch.cuda.max_memory_allocated() / 1e9 if device.type == "cuda" else 0
 
-                entry = {
-                    "stage": stage_idx, "stage_step": stage_step,
-                    "step": global_step, "loss": round(avg_running, 4),
-                    "ppl": round(ppl, 2), "lr": round(lr, 8),
-                    "grad_norm": round(grad_norm.item(), 4),
-                    "steps_per_sec": round(steps_per_sec, 3),
-                    "tokens_per_sec": round(tokens_per_sec),
-                    "total_tokens": total_tokens,
-                    "avg_cmds_per_session": round(avg_cmds, 1),
-                    "gpu_mem_gb": round(mem_used, 2),
-                    "gpu_peak_gb": round(mem_peak, 2),
-                }
-                log(entry)
+                log({"stage": stage_idx, "stage_step": stage_step,
+                     "step": global_step, "loss": round(avg_running, 4),
+                     "ppl": round(ppl, 2), "lr": round(lr, 8),
+                     "grad_norm": round(grad_norm.item(), 4),
+                     "steps_per_sec": round(steps_per_sec, 3),
+                     "total_tokens": total_tokens,
+                     "avg_cmds_per_session": round(avg_cmds, 1),
+                     "gpu_peak_gb": round(mem_peak, 2)})
 
-                eta_stage = (stage_max_steps - stage_step) / max(steps_per_sec, 0.001)
-                print(f"  S{stage_idx} {stage_step:>5d}/{stage_max_steps} "
-                      f"(g:{global_step}) | loss {avg_running:.4f} | ppl {ppl:>7.2f} | "
-                      f"lr {lr:.2e} | {steps_per_sec:.2f} s/s | {avg_cmds:.0f} cmd/sess | "
-                      f"gpu {mem_peak:.1f}GB | eta {eta_stage/60:.0f}m")
+                print(f"  S{stage_idx} {stage_step:>5d} (g:{global_step}) | "
+                      f"loss {avg_running:.4f} | ppl {ppl:>7.2f} | "
+                      f"lr {lr:.2e} | {steps_per_sec:.2f} s/s | "
+                      f"{avg_cmds:.0f} cmd/sess | gpu {mem_peak:.1f}GB")
 
                 running_loss = 0.0
                 running_cmds = 0
                 step_t0 = time.time()
 
-            # --- Gate check ---
             if stage_step % cfg.gate_check_every == 0:
-                print(f"\n  Gate check at stage step {stage_step}...")
-
-                loss_metrics = evaluate_loss(model, val_ds, device)
-
+                print(f"\n  Gate check at step {stage_step}...")
                 gate_passed, gate_metrics = run_gate_tests(
                     model, stage_idx, device, log_fn=log)
-
                 log({"type": "gate_check", "stage": stage_idx,
                      "stage_step": stage_step, "step": global_step,
-                     **loss_metrics, **gate_metrics})
-                print(f"  val_loss={loss_metrics['val_loss']:.4f}  "
-                      f"val_ppl={loss_metrics['val_ppl']:.2f}  "
-                      f"gate={gate_metrics['gate_correct']}/{gate_metrics['gate_total']}")
+                     **gate_metrics})
 
-                # Always save a resumable checkpoint
+                # Save checkpoint
                 torch.save({
                     "global_step": global_step,
                     "stage": stage_idx,
@@ -663,104 +474,43 @@ def train_curriculum(cfg: CurriculumConfig):
                     "config": model_config,
                 }, str(ckpt_dir / "latest.pt"))
 
-                if is_anneal:
-                    if stage_step % 1000 == 0:
-                        ckpt_path = str(ckpt_dir / f"anneal_step{global_step}.pt")
-                        torch.save({
-                            "global_step": global_step,
-                            "stage": stage_idx,
-                            "model_state_dict": model.state_dict(),
-                            "optimizer_state_dict": optimizer.state_dict(),
-                            "config": model_config,
-                        }, ckpt_path)
-                        print(f"  Saved: {ckpt_path}")
-                    print()
-                elif gate_passed:
-                    print(f"  GATE PASSED - all tests correct, advancing")
+                if gate_passed:
+                    print(f"  GATE PASSED — advancing!")
                     passed_gate = True
-
-                    ckpt_path = str(ckpt_dir / f"stage{stage_idx}_passed.pt")
                     torch.save({
                         "global_step": global_step,
                         "stage": stage_idx,
                         "model_state_dict": model.state_dict(),
                         "optimizer_state_dict": optimizer.state_dict(),
-                        "gate_metrics": gate_metrics,
                         "config": model_config,
-                    }, ckpt_path)
-                    print(f"  Saved: {ckpt_path}\n")
+                    }, str(ckpt_dir / f"stage{stage_idx}_passed.pt"))
                     break
                 else:
-                    print(f"  Not yet — continuing training\n")
+                    print(f"  Not yet — continuing\n")
 
         train_ds.stop()
 
-        # Stage only exits via gate pass (or anneal completion)
-
-    # --- Done ---
-    elapsed_total = time.time() - t0_global
-    print(f"\n{'='*70}")
-    print(f"  Curriculum complete!")
-    print(f"  Total steps: {global_step}")
-    print(f"  Total tokens: {total_tokens:,}")
-    print(f"  Total time: {elapsed_total/3600:.1f} hours")
-    print(f"{'='*70}")
-
-    final_path = str(ckpt_dir / "final.pt")
-    torch.save({
-        "global_step": global_step,
-        "stage": len(STAGES) - 1,
-        "model_state_dict": model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-        "config": model_config,
-    }, final_path)
-    print(f"Saved: {final_path}")
-
+    print(f"\nCurriculum complete!")
     log_file.close()
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
 if __name__ == "__main__":
     import argparse
-
-    parser = argparse.ArgumentParser(description="Curriculum training for BashTransformer (Phase 2)")
-    parser.add_argument("--grad-accum", type=int, default=1)
-    parser.add_argument("--steps-per-stage", type=int, default=10000)
-    parser.add_argument("--gate-check-every", type=int, default=500)
-    parser.add_argument("--warmup-steps", type=int, default=100)
-    parser.add_argument("--max-lr", type=float, default=3e-4)
-    parser.add_argument("--min-lr", type=float, default=3e-5)
-    parser.add_argument("--log-every", type=int, default=10)
-    parser.add_argument("--data-workers", type=int, default=4)
-    parser.add_argument("--buffer-size", type=int, default=16)
-    parser.add_argument("--seed", type=int, default=42)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--min-ops", type=int, default=10)
+    parser.add_argument("--target-ops", type=int, default=30)
     parser.add_argument("--ckpt-dir", type=str, default="checkpoints")
     parser.add_argument("--resume-stage", type=int, default=0)
     parser.add_argument("--resume-ckpt", type=str, default=None)
-    parser.add_argument("--min-ops", type=int, default=30)
-    parser.add_argument("--target-ops", type=int, default=80)
-
+    parser.add_argument("--gate-check-every", type=int, default=500)
     args = parser.parse_args()
 
     cfg = CurriculumConfig(
-        grad_accum=args.grad_accum,
-        steps_per_stage=args.steps_per_stage,
-        gate_check_every=args.gate_check_every,
-        warmup_steps=args.warmup_steps,
-        max_lr=args.max_lr,
-        min_lr=args.min_lr,
-        log_every=args.log_every,
-        data_workers=args.data_workers,
-        buffer_size=args.buffer_size,
-        seed=args.seed,
+        min_ops=args.min_ops,
+        target_ops=args.target_ops,
         ckpt_dir=args.ckpt_dir,
         resume_stage=args.resume_stage,
         resume_ckpt=args.resume_ckpt,
-        min_ops=args.min_ops,
-        target_ops=args.target_ops,
+        gate_check_every=args.gate_check_every,
     )
-
     train_curriculum(cfg)

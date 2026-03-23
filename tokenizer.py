@@ -21,8 +21,9 @@ class BashTokenizer:
         # Punctuation (9)
         punctuation = ["/", ".", "_", "-", ">", ">>", '"', " ", "\n"]
 
-        # Special tokens (7)
-        special = ["<prompt>", "<eoi>", "<output>", "<err>", "<eor>", "<pad>", "<eos>"]
+        # Special tokens (9)
+        special = ["<prompt>", "<eoi>", "<output>", "<err>", "<eor>", "<pad>", "<eos>",
+                   "<state>", "<nop>"]
 
         # Shell chrome (3)
         chrome = ["@", ":", "#"]
@@ -44,6 +45,8 @@ class BashTokenizer:
         self.eor_id = self.token_to_id["<eor>"]     # end of response
         self.newline_id = self.token_to_id["\n"]
         self.space_id = self.token_to_id[" "]
+        self.state_id = self.token_to_id["<state>"]   # state patch begins
+        self.nop_id = self.token_to_id["<nop>"]       # no state change
 
         # Precompute multi-char tokens sorted longest-first for greedy matching
         self._multi_char_tokens = sorted(

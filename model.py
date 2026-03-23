@@ -2,12 +2,10 @@
 Transformer language model for bash terminal simulation.
 Trained from scratch — no external dependencies beyond PyTorch.
 
-Phase 2 architecture: standard transformer for within-command processing +
-Gated DeltaNet state layer for cross-command memory. The state matrix S
-is a key-value associative memory updated via the delta rule — it can store,
-update, and erase distinct entries without destroying other information.
-
-No token history crosses command boundaries — only the state matrix persists.
+Phase 2 architecture: pure autoregressive transformer with state patches.
+Each command is processed with the full state string prepended. The model
+outputs the response + a state patch. The patch is applied to produce
+the state for the next command. No memory modules — just tokens.
 """
 
 from __future__ import annotations
@@ -28,7 +26,7 @@ from torch.utils.checkpoint import checkpoint
 
 @dataclass
 class BashTransformerConfig:
-    vocab_size: int = 63
+    vocab_size: int = 65  # 63 original + <state> + <nop>
     hidden_dim: int = 512
     num_layers: int = 6
     num_heads: int = 8
@@ -38,17 +36,10 @@ class BashTransformerConfig:
     rms_norm_eps: float = 1e-6
     tie_embeddings: bool = True
     gradient_checkpointing: bool = False
-    # DeltaNet state
-    state_dim: int = 256  # state matrix is (state_heads, head_dim, head_dim)
-    state_heads: int = 8  # parallel state heads
 
     @property
     def head_dim(self) -> int:
         return self.hidden_dim // self.num_heads
-
-    @property
-    def state_head_dim(self) -> int:
-        return self.state_dim // self.state_heads
 
 
 # ---------------------------------------------------------------------------
@@ -127,7 +118,7 @@ def apply_rotary_pos_emb(
 
 
 # ---------------------------------------------------------------------------
-# Attention (standard causal self-attention for within-command processing)
+# Attention
 # ---------------------------------------------------------------------------
 
 class Attention(nn.Module):
@@ -178,135 +169,14 @@ class SwiGLUFFN(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Gated DeltaNet State Layer — cross-command memory
-# ---------------------------------------------------------------------------
-
-class GatedDeltaState(nn.Module):
-    """Gated DeltaNet state layer for cross-command memory.
-
-    Maintains a state matrix S (per head) that acts as key-value associative
-    memory. Updated via the gated delta rule which supports:
-    - Targeted writes: store specific key-value pairs without overwriting others
-    - Selective forgetting: decay gate can erase specific entries
-    - Associative reads: query the state to retrieve stored values
-
-    State shape: (batch, num_heads, head_dim, head_dim)
-
-    Used between commands: the transformer processes command tokens normally,
-    then this layer updates S from the command and reads from S to inject
-    context into the next command.
-    """
-
-    def __init__(self, config: BashTransformerConfig):
-        super().__init__()
-        self.num_heads = config.state_heads
-        self.head_dim = config.state_head_dim
-        self.state_dim = config.state_dim
-
-        # Project from hidden_dim to state space
-        self.W_k = nn.Linear(config.hidden_dim, config.state_dim, bias=False)
-        self.W_v = nn.Linear(config.hidden_dim, config.state_dim, bias=False)
-        self.W_q = nn.Linear(config.hidden_dim, config.state_dim, bias=False)
-
-        # Gates
-        self.W_beta = nn.Linear(config.hidden_dim, config.state_dim)  # update strength
-        self.W_alpha = nn.Linear(config.hidden_dim, config.state_dim)  # decay
-        # Bias alpha toward retaining (init positive = slow decay)
-        nn.init.constant_(self.W_alpha.bias, 2.0)
-
-        # Project state readout back to hidden_dim
-        self.W_out = nn.Linear(config.state_dim, config.hidden_dim, bias=False)
-        self.norm = RMSNorm(config.state_dim)
-        self.gate_proj = nn.Linear(config.hidden_dim, config.state_dim, bias=False)
-
-    def reset_state(self, batch_size: int, device: torch.device,
-                    dtype: torch.dtype) -> torch.Tensor:
-        """Return zero-initialized state: (batch, num_heads, head_dim, head_dim)."""
-        return torch.zeros(
-            batch_size, self.num_heads, self.head_dim, self.head_dim,
-            device=device, dtype=dtype,
-        )
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,   # (batch, seq_len, hidden_dim)
-        state: torch.Tensor,           # (batch, num_heads, head_dim, head_dim)
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Process a sequence of tokens, updating state and producing readouts.
-
-        Returns (output, new_state):
-        - output: (batch, seq_len, hidden_dim) — state-informed context
-        - new_state: (batch, num_heads, head_dim, head_dim) — updated state
-        """
-        bsz, seq_len, _ = hidden_states.shape
-        h = self.num_heads
-        d = self.head_dim
-
-        # Project to state space: (batch, seq_len, num_heads, head_dim)
-        k = self.W_k(hidden_states).view(bsz, seq_len, h, d)
-        v = self.W_v(hidden_states).view(bsz, seq_len, h, d)
-        q = self.W_q(hidden_states).view(bsz, seq_len, h, d)
-
-        # Gates
-        beta = torch.sigmoid(self.W_beta(hidden_states)).view(bsz, seq_len, h, d)
-        alpha = torch.sigmoid(self.W_alpha(hidden_states)).view(bsz, seq_len, h, d)
-
-        # Normalize keys for stable associative memory
-        k = F.normalize(k, dim=-1)
-
-        # Output gate for mixing state readout with input
-        gate = self.gate_proj(hidden_states)  # (batch, seq_len, state_dim)
-
-        # Process tokens recurrently through state
-        outputs = []
-        S = state  # (batch, num_heads, head_dim, head_dim)
-
-        for t in range(seq_len):
-            k_t = k[:, t]      # (batch, h, d)
-            v_t = v[:, t]      # (batch, h, d)
-            q_t = q[:, t]      # (batch, h, d)
-            beta_t = beta[:, t]  # (batch, h, d)
-            alpha_t = alpha[:, t]  # (batch, h, d)
-
-            # Decay state: S = alpha * S
-            S = S * alpha_t.unsqueeze(-1)  # broadcast over last dim
-
-            # Delta update: S = S + beta * (v - S^T k) k^T
-            # S^T k = prediction for this key
-            pred = torch.einsum("bhij,bhj->bhi", S, k_t)  # (batch, h, d)
-            error = v_t - pred  # (batch, h, d)
-            # Outer product update
-            update = torch.einsum("bhi,bhj->bhij", beta_t * error, k_t)
-            S = S + update
-
-            # Read from state: o = S q
-            readout = torch.einsum("bhij,bhj->bhi", S, q_t)  # (batch, h, d)
-            readout = readout.reshape(bsz, self.state_dim)  # (batch, state_dim)
-            outputs.append(readout)
-
-        # Stack outputs: (batch, seq_len, state_dim)
-        context = torch.stack(outputs, dim=1)
-
-        # Normalize, gate, project back to hidden_dim
-        context = self.norm(context) * F.silu(gate)
-        output = self.W_out(context)
-
-        return output, S
-
-
-# ---------------------------------------------------------------------------
 # Transformer Block
 # ---------------------------------------------------------------------------
 
 class TransformerBlock(nn.Module):
     def __init__(self, config: BashTransformerConfig):
         super().__init__()
-        # State read — inject memory context at this layer
-        self.state_read = GatedDeltaState(config)
-        # Self attention
         self.attn_norm = RMSNorm(config.hidden_dim, config.rms_norm_eps)
         self.attn = Attention(config)
-        # FFN
         self.ffn_norm = RMSNorm(config.hidden_dim, config.rms_norm_eps)
         self.ffn = SwiGLUFFN(config)
 
@@ -315,19 +185,14 @@ class TransformerBlock(nn.Module):
         hidden_states: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
-        state: torch.Tensor,
     ) -> torch.Tensor:
-        # Read from state: inject memory context
-        state_context, _ = self.state_read(hidden_states, state)
-        hidden_states = hidden_states + state_context
-        # Self attention + FFN
         hidden_states = hidden_states + self.attn(self.attn_norm(hidden_states), cos, sin)
         hidden_states = hidden_states + self.ffn(self.ffn_norm(hidden_states))
         return hidden_states
 
 
 # ---------------------------------------------------------------------------
-# BashTransformer — transformer + DeltaNet state
+# BashTransformer — pure autoregressive
 # ---------------------------------------------------------------------------
 
 class BashTransformer(nn.Module):
@@ -335,28 +200,20 @@ class BashTransformer(nn.Module):
         super().__init__()
         self.config = config
 
-        # Token embeddings
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_dim)
 
-        # Rotary position embeddings
         self.rotary_emb = RotaryEmbedding(
             config.head_dim,
             max_positions=config.max_position_embeddings,
             theta=config.rope_theta,
         )
 
-        # DeltaNet state write layer — updates state from command output
-        self.state_write = GatedDeltaState(config)
-
-        # Transformer layers (each has its own state read)
         self.layers = nn.ModuleList([
             TransformerBlock(config) for _ in range(config.num_layers)
         ])
 
-        # Final norm
         self.norm = RMSNorm(config.hidden_dim, config.rms_norm_eps)
 
-        # LM head
         self.lm_head = nn.Linear(config.hidden_dim, config.vocab_size, bias=False)
         if config.tie_embeddings:
             self.lm_head.weight = self.embed_tokens.weight
@@ -397,56 +254,31 @@ class BashTransformer(nn.Module):
     def from_config(cls) -> "BashTransformer":
         return cls(BashTransformerConfig())
 
-    def reset_memory(self, batch_size: int, device: torch.device,
-                     dtype: torch.dtype) -> torch.Tensor:
-        """Return zero-initialized state: (batch, num_heads, head_dim, head_dim)."""
-        return self.state_write.reset_state(batch_size, device, dtype)
-
     def forward(
         self,
         input_ids: torch.Tensor,
-        memory: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
         loss_weights: Optional[torch.Tensor] = None,
     ) -> dict[str, torch.Tensor]:
-        """
-        Args:
-            input_ids: (batch, seq_len) token IDs for a single command
-            memory: (batch, num_heads, head_dim, head_dim) state matrix, or None
-            labels: (batch, seq_len) target IDs, -100 for ignored positions
-            loss_weights: (batch, seq_len) per-token loss weights
-
-        Returns:
-            dict with 'logits', 'memory', and optionally 'loss'
-        """
         bsz, seq_len = input_ids.shape
-
-        if memory is None:
-            memory = self.reset_memory(bsz, input_ids.device,
-                                       self.embed_tokens.weight.dtype)
 
         hidden_states = self.embed_tokens(input_ids)
 
-        # Get RoPE cos/sin
         cos, sin = self.rotary_emb(hidden_states)
 
-        # Run through transformer layers — each reads from state
         for layer in self.layers:
             if self._gradient_checkpointing and self.training:
                 hidden_states = checkpoint(
-                    layer, hidden_states, cos, sin, memory,
+                    layer, hidden_states, cos, sin,
                     use_reentrant=False,
                 )
             else:
-                hidden_states = layer(hidden_states, cos, sin, memory)
-
-        # Write to state: update memory from this command's output
-        _, new_memory = self.state_write(hidden_states, memory)
+                hidden_states = layer(hidden_states, cos, sin)
 
         hidden_states = self.norm(hidden_states)
         logits = self.lm_head(hidden_states)
 
-        result: dict[str, torch.Tensor] = {"logits": logits, "memory": new_memory}
+        result: dict[str, torch.Tensor] = {"logits": logits}
 
         if labels is not None:
             shift_logits = logits[:, :-1, :].contiguous()
@@ -480,81 +312,29 @@ class BashTransformer(nn.Module):
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("BashTransformer — Architecture Verification (DeltaNet)")
+    print("BashTransformer — Architecture Verification (State Patch)")
     print("=" * 60)
 
     config = BashTransformerConfig()
     print(f"\nConfig:")
-    print(f"  vocab_size:          {config.vocab_size}")
-    print(f"  hidden_dim:          {config.hidden_dim}")
-    print(f"  num_layers:          {config.num_layers}")
-    print(f"  num_heads:           {config.num_heads}")
-    print(f"  head_dim:            {config.head_dim}")
-    print(f"  ffn_intermediate:    {config.ffn_intermediate}")
-    print(f"  state_dim:           {config.state_dim}")
-    print(f"  state_heads:         {config.state_heads}")
-    print(f"  state_head_dim:      {config.state_head_dim}")
+    for k, v in config.__dict__.items():
+        print(f"  {k}: {v}")
 
     print(f"\nCreating model...")
     model = BashTransformer.from_config()
 
     total = model.num_parameters()
-    print(f"\nArchitecture summary:")
-    print(f"  Total parameters:         {total:>12,}")
+    print(f"\n  Total parameters:         {total:>12,}")
     print(f"  Non-embedding parameters: {model.num_parameters(exclude_embeddings=True):>12,}")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = model.to(device)
 
-    # Single command forward pass
-    print(f"\n{'=' * 60}")
-    print("Forward pass test (single command, seq_len=32)")
-    print("=" * 60)
-    dummy_ids = torch.randint(0, config.vocab_size, (2, 32), device=device)
-    dummy_labels = torch.randint(0, config.vocab_size, (2, 32), device=device)
+    dummy = torch.randint(0, config.vocab_size, (2, 128), device=device)
+    labels = torch.randint(0, config.vocab_size, (2, 128), device=device)
 
     with torch.no_grad():
-        out = model(dummy_ids, labels=dummy_labels)
-
-    print(f"  logits shape: {out['logits'].shape}")
-    print(f"  memory shape: {out['memory'].shape}")
-    print(f"  loss:         {out['loss'].item():.4f}")
-
-    # Multi-command session — state carries forward
-    print(f"\n{'=' * 60}")
-    print("Session test (5 commands, state carried forward)")
-    print("=" * 60)
-    memory = None
-    for i in range(5):
-        cmd_ids = torch.randint(0, config.vocab_size, (1, 20), device=device)
-        with torch.no_grad():
-            out = model(cmd_ids, memory=memory)
-        memory = out["memory"]
-        mem_norm = memory.norm().item()
-        print(f"  Command {i+1}: logits {out['logits'].shape}, state norm {mem_norm:.2f}")
-
-    # Full BPTT test
-    print(f"\n{'=' * 60}")
-    print("Full BPTT test (3 commands, single backward)")
-    print("=" * 60)
-    model.enable_gradient_checkpointing()
-    model.train()
-    memory = model.reset_memory(1, torch.device(device), model.embed_tokens.weight.dtype)
-    total_loss = None
-    for i in range(3):
-        cmd = torch.randint(0, config.vocab_size, (1, 20), device=device)
-        lbl = torch.randint(0, config.vocab_size, (1, 20), device=device)
-        out = model(cmd, memory=memory, labels=lbl)
-        memory = out["memory"]  # no detach
-        n = (lbl != -100).sum().item()
-        if total_loss is None:
-            total_loss = out["loss"] * n
-        else:
-            total_loss = total_loss + out["loss"] * n
-    total_loss.backward()
-    print(f"  Full BPTT backward OK, loss={total_loss.item():.4f}")
-
-    print(f"\n  State matrix: {config.state_heads} heads × {config.state_head_dim}×{config.state_head_dim}")
-    print(f"  = {config.state_heads * config.state_head_dim * config.state_head_dim:,} floats of associative memory")
-
+        out = model(dummy, labels=labels)
+    print(f"\n  Forward pass: logits {out['logits'].shape}, loss {out['loss'].item():.4f}")
+    print(f"  Expected loss (random): {math.log(config.vocab_size):.4f}")
     print(f"\nAll checks passed.")

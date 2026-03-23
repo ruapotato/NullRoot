@@ -288,6 +288,118 @@ class FileSystem:
         """Get all directories except root."""
         return [d for d in sorted(self.dirs) if d != "/"]
 
+    # --- State serialization ---
+    # Format: @CWD#PATH:CHILDREN#PATH:CHILDREN#PATH>CONTENT
+    #   @ = CWD marker
+    #   # = entry separator
+    #   : = dir listing (children separated by spaces)
+    #   > = file content
+
+    def serialize_state(self) -> str:
+        """Serialize full filesystem state to a compact token string."""
+        parts = [f"@{self.cwd}"]
+
+        # All directories with their children
+        for d in sorted(self.dirs):
+            children = self.list_dir(d)
+            children_str = " ".join(children) if children else ""
+            parts.append(f"{d}:{children_str}")
+
+        # All files with content
+        for f in sorted(self.files):
+            content = self.files[f]
+            parts.append(f"{f}>{content}")
+
+        return "#".join(parts)
+
+    def compute_patch(self, old_state: str) -> str:
+        """Compute minimal patch between old_state and current state.
+
+        Returns only the entries that changed. If nothing changed, returns "".
+        The patch contains only the entries that differ — can be applied by
+        find-and-replace keyed on the path prefix.
+        """
+        new_state = self.serialize_state()
+        if old_state == new_state:
+            return ""
+
+        old_entries = self._parse_entries(old_state)
+        new_entries = self._parse_entries(new_state)
+
+        patch_parts = []
+
+        # Find changed or new entries
+        for key, value in new_entries.items():
+            if key not in old_entries or old_entries[key] != value:
+                patch_parts.append(value)
+
+        # Find deleted entries (in old but not in new)
+        for key in old_entries:
+            if key not in new_entries:
+                # Mark deletion with the path and empty marker
+                if ":" in old_entries[key]:
+                    # Was a dir entry — emit path with minus
+                    patch_parts.append(f"-{key}")
+                elif ">" in old_entries[key]:
+                    patch_parts.append(f"-{key}")
+
+        return "#".join(patch_parts)
+
+    @staticmethod
+    def _parse_entries(state: str) -> dict[str, str]:
+        """Parse serialized state into {key: full_entry} dict."""
+        entries = {}
+        if not state:
+            return entries
+        for part in state.split("#"):
+            if not part:
+                continue
+            if part.startswith("@"):
+                entries["@"] = part
+            elif ">" in part:
+                path = part[:part.index(">")]
+                entries[path] = part
+            elif ":" in part:
+                path = part[:part.index(":")]
+                entries[path] = part
+            elif part.startswith("-"):
+                # Deletion marker
+                entries[part] = part
+        return entries
+
+    @staticmethod
+    def apply_patch(state: str, patch: str) -> str:
+        """Apply a patch to a state string, returning new state."""
+        if not patch:
+            return state
+
+        old_entries = FileSystem._parse_entries(state)
+        patch_entries = FileSystem._parse_entries(patch)
+
+        # Apply changes
+        for key, value in patch_entries.items():
+            if value.startswith("-"):
+                # Deletion
+                del_key = value[1:]  # remove the -
+                old_entries.pop(del_key, None)
+            else:
+                old_entries[key] = value
+
+        # Reconstruct: CWD first, then dirs sorted, then files sorted
+        parts = []
+        if "@" in old_entries:
+            parts.append(old_entries.pop("@"))
+
+        dir_entries = sorted((k, v) for k, v in old_entries.items() if ":" in v)
+        file_entries = sorted((k, v) for k, v in old_entries.items() if ">" in v)
+
+        for _, v in dir_entries:
+            parts.append(v)
+        for _, v in file_entries:
+            parts.append(v)
+
+        return "#".join(parts)
+
 
 def _random_content(rng: random.Random) -> str:
     """Generate random short file content using only valid token characters."""
