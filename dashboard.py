@@ -137,7 +137,7 @@ HTML = """<!DOCTYPE html>
   <div class="card full">
     <h2>Gate Checks</h2>
     <table class="tbl" id="gateTable">
-      <thead><tr><th>Stage</th><th>Step</th><th>Tests</th><th>Val Loss</th><th>Val PPL</th><th>Result</th><th>Time</th></tr></thead>
+      <thead><tr><th>Stage</th><th>Step</th><th>Tests</th><th>All</th><th>Result</th><th>Time</th></tr></thead>
       <tbody id="gateBody"><tr><td colspan="7" style="color:#8b949e">No gate checks yet</td></tr></tbody>
     </table>
   </div>
@@ -270,15 +270,15 @@ function update(data) {
   setChart(lossChart, xyData('loss'));
   setChart(pplChart, xyData('ppl'));
   setChart(lrChart, xyData('lr'));
-  setChart(speedChart, xyData('tokens_per_sec'));
+  setChart(speedChart, t.map(e => ({ x: e.step, y: e.tokens_per_sec || e.steps_per_sec || 0 })));
 
   const last = t[t.length - 1];
-  document.getElementById('s-step').textContent = last.step.toLocaleString();
-  document.getElementById('s-loss').textContent = last.loss.toFixed(4);
-  document.getElementById('s-ppl').textContent = last.ppl.toFixed(1);
-  document.getElementById('s-speed').textContent = last.tokens_per_sec.toLocaleString();
-  document.getElementById('s-lr').textContent = last.lr.toExponential(2);
-  document.getElementById('s-gnorm').textContent = last.grad_norm.toFixed(2);
+  document.getElementById('s-step').textContent = (last.step || 0).toLocaleString();
+  document.getElementById('s-loss').textContent = (last.loss || 0).toFixed(4);
+  document.getElementById('s-ppl').textContent = (last.ppl || 0).toFixed(1);
+  document.getElementById('s-speed').textContent = (last.tokens_per_sec || last.steps_per_sec || 0).toLocaleString();
+  document.getElementById('s-lr').textContent = (last.lr || 0).toExponential(2);
+  document.getElementById('s-gnorm').textContent = (last.grad_norm || 0).toFixed(2);
   document.getElementById('s-gpu').textContent = (last.gpu_peak_gb || 0).toFixed(1);
 
   // Latest gate val loss
@@ -298,12 +298,13 @@ function update(data) {
       const passed = g.gate_passed;
       const gc = g.gate_correct || 0;
       const gt = g.gate_total || 0;
+      const ac = g.all_correct || 0;
+      const at = g.all_total || 0;
       return '<tr>' +
-        '<td>S' + g.stage + ': ' + STAGE_NAMES[g.stage] + '</td>' +
-        '<td>' + g.step + '</td>' +
+        '<td>S' + (g.stage+1) + ': ' + (STAGE_NAMES[g.stage]||'?') + '</td>' +
+        '<td>' + (g.step||'') + '</td>' +
         '<td>' + gc + '/' + gt + '</td>' +
-        '<td>' + (g.val_loss||0).toFixed(4) + '</td>' +
-        '<td>' + (g.val_ppl||0).toFixed(2) + '</td>' +
+        '<td>' + ac + '/' + at + '</td>' +
         '<td class="' + (passed ? 'pass' : 'fail') + '">' + (passed ? 'PASS' : 'FAIL') + '</td>' +
         '<td>' + (g.timestamp||'') + '</td></tr>';
     }).join('');
