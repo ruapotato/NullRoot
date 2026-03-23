@@ -271,7 +271,7 @@ def _execute_cmd_on_fs(fs, cmd_str):
         fs.touch(parts[1])
     elif cmd == "ls" or cmd == "pwd":
         pass  # read-only
-    elif cmd == "echo" and ">" in parts:
+    elif cmd == "echo" and (">" in parts or ">>" in parts):
         if ">>" in parts:
             idx = parts.index(">>")
             content = " ".join(parts[1:idx])

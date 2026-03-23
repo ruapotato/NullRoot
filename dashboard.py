@@ -160,11 +160,10 @@ const STAGE_DEFS = [
   { name: 'S6', label: '+echo\u00a0>>', cmds: ['mkdir', 'cd', 'ls', 'pwd', 'touch', 'echo\u00a0>', 'cat', 'echo\u00a0>>'] },
   { name: 'S7', label: '+rm',          cmds: ['mkdir', 'cd', 'ls', 'pwd', 'touch', 'echo\u00a0>', 'cat', 'echo\u00a0>>', 'rm'] },
   { name: 'S8', label: '+errors',      cmds: ['mkdir', 'cd', 'ls', 'pwd', 'touch', 'echo\u00a0>', 'cat', 'echo\u00a0>>', 'rm', '<err>'] },
-  { name: 'S9', label: 'anneal',      cmds: ['all commands', 'low LR decay'] },
 ];
 const STAGE_NAMES = STAGE_DEFS.map(s => s.label);
 const STAGE_COLORS = [
-  '#f85149', '#d29922', '#3fb950', '#58a6ff', '#bc8cff', '#f778ba', '#79c0ff', '#ffa657', '#da7b22'
+  '#f85149', '#d29922', '#3fb950', '#58a6ff', '#bc8cff', '#f778ba', '#79c0ff', '#ffa657'
 ];
 
 const chartOpts = (label, color) => ({
@@ -240,7 +239,7 @@ function update(data) {
   if (stages.length) {
     const latest = stages[stages.length-1];
     stageTitle.textContent = latest.name || ('Stage ' + latest.stage);
-    stageDesc.textContent = 'Stage ' + (currentStage+1) + '/9 | ' + passedStages.size + ' gates passed';
+    stageDesc.textContent = 'Stage ' + (currentStage+1) + '/8 | ' + passedStages.size + ' gates passed';
   }
 
   // Stage definitions
