@@ -26,7 +26,8 @@ from torch.amp import autocast
 
 from tokenizer import BashTokenizer
 from model import BashTransformer, BashTransformerConfig
-from dataset import BashSessionDataset, BashValidationDataset, _build_labels
+from dataset import (BashSessionDataset, BashValidationDataset, RecallDataset,
+                     generate_recall_session, _build_labels)
 from generator import SessionGenerator
 
 
@@ -35,6 +36,12 @@ from generator import SessionGenerator
 # ---------------------------------------------------------------------------
 
 STAGES = [
+    {
+        "name": "Stage 0: memory warmup (letter recall)",
+        "commands": None,
+        "error_rate": 0.0,
+        "recall": True,
+    },
     {
         "name": "Stage 1: mkdir + cd + ls",
         "commands": {"mkdir", "cd_child", "cd_up", "cd_abs", "ls"},
@@ -117,19 +124,26 @@ class StageValidationDataset(torch.utils.data.Dataset):
 
     def __init__(self, stage_idx: int, num_sessions: int = 10, seed: int = 99999):
         self.tokenizer = BashTokenizer()
-
-        from dataset import split_session_into_commands
-        transcripts = generate_stage_validation(
-            stage_idx, num_sessions=num_sessions, seed=seed,
-        )
         self.samples = []
-        for t in transcripts:
-            try:
-                cmds = split_session_into_commands(t, self.tokenizer)
+
+        stage = STAGES[stage_idx]
+        if stage.get("recall"):
+            for i in range(num_sessions):
+                cmds = generate_recall_session(num_cmds=10, seed=seed + i)
                 if cmds:
                     self.samples.append(cmds)
-            except ValueError:
-                continue
+        else:
+            from dataset import split_session_into_commands
+            transcripts = generate_stage_validation(
+                stage_idx, num_sessions=num_sessions, seed=seed,
+            )
+            for t in transcripts:
+                try:
+                    cmds = split_session_into_commands(t, self.tokenizer)
+                    if cmds:
+                        self.samples.append(cmds)
+                except ValueError:
+                    continue
 
     def __len__(self):
         return len(self.samples)
@@ -146,7 +160,20 @@ def _build_gate_tests(stage_idx: int) -> list[list[tuple[str, str]]]:
     """Build targeted test scripts for a curriculum stage."""
     tests = []
 
-    if stage_idx >= 0:  # Stage 1: mkdir + cd + ls
+    if stage_idx == 0:  # Stage 0: word recall
+        tests.append([
+            ("gak", "<err>gak<eor>"),
+            ("plim", "<err>gak plim<eor>"),
+            ("tov", "<err>gak plim tov<eor>"),
+        ])
+        tests.append([
+            ("brel", "<err>brel<eor>"),
+            ("shuf", "<err>brel shuf<eor>"),
+            ("dox", "<err>brel shuf dox<eor>"),
+        ])
+        return tests
+
+    if stage_idx >= 1:  # Stage 1: mkdir + cd + ls
         tests.append([
             ("mkdir gal", "<output><eor>"),
             ("mkdir tov", "<output><eor>"),
@@ -167,7 +194,7 @@ def _build_gate_tests(stage_idx: int) -> list[list[tuple[str, str]]]:
             ("ls", "<output>rak  sub<eor>"),
         ])
 
-    if stage_idx >= 1:  # Stage 2: + pwd
+    if stage_idx >= 2:  # Stage 2: + pwd
         tests.append([
             ("pwd", "<output>/<eor>"),
             ("mkdir wun", "<output><eor>"),
@@ -180,7 +207,7 @@ def _build_gate_tests(stage_idx: int) -> list[list[tuple[str, str]]]:
             ("pwd", "<output>/wun<eor>"),
         ])
 
-    if stage_idx >= 2:  # Stage 3: + touch
+    if stage_idx >= 3:  # Stage 3: + touch
         tests.append([
             ("mkdir tdir", "<output><eor>"),
             ("cd tdir", "<output><eor>"),
@@ -189,13 +216,13 @@ def _build_gate_tests(stage_idx: int) -> list[list[tuple[str, str]]]:
             ("ls", "<output>fob.txt  zel<eor>"),
         ])
 
-    if stage_idx >= 3:  # Stage 4: + echo >
+    if stage_idx >= 4:  # Stage 4: + echo >
         tests.append([
             ("echo hello world > greet.txt", "<output><eor>"),
             ("ls", "<output>greet.txt<eor>"),
         ])
 
-    if stage_idx >= 4:  # Stage 5: + cat
+    if stage_idx >= 5:  # Stage 5: + cat
         tests.append([
             ("echo test data here > myfile", "<output><eor>"),
             ("cat myfile", "<output>test data here<eor>"),
@@ -207,14 +234,14 @@ def _build_gate_tests(stage_idx: int) -> list[list[tuple[str, str]]]:
             ("cat inner.txt", "<output>inside dir<eor>"),
         ])
 
-    if stage_idx >= 5:  # Stage 6: + echo >>
+    if stage_idx >= 6:  # Stage 6: + echo >>
         tests.append([
             ("echo first line > log.txt", "<output><eor>"),
             ("echo second line >> log.txt", "<output><eor>"),
             ("cat log.txt", "<output>first line\nsecond line<eor>"),
         ])
 
-    if stage_idx >= 6:  # Stage 7: + rm
+    if stage_idx >= 7:  # Stage 7: + rm
         tests.append([
             ("echo data > tmp.dat", "<output><eor>"),
             ("ls", "<output>tmp.dat<eor>"),
@@ -222,7 +249,7 @@ def _build_gate_tests(stage_idx: int) -> list[list[tuple[str, str]]]:
             ("ls", "<output><eor>"),
         ])
 
-    if stage_idx >= 7:  # Stage 8: + errors
+    if stage_idx >= 8:  # Stage 8: + errors
         tests.append([
             ("cd nofolder", "<err><eor>"),
             ("cat nofile.txt", "<err><eor>"),
@@ -471,7 +498,7 @@ def train_curriculum(cfg: CurriculumConfig):
         stage = STAGES[stage_idx]
         print(f"\n{'='*70}")
         print(f"  {stage['name']}")
-        print(f"  Commands: {sorted(stage['commands'])}")
+        print(f"  Commands: {sorted(stage['commands']) if stage['commands'] else 'N/A (recall)'}")
         print(f"  Error rate: {stage['error_rate']}")
         print(f"{'='*70}\n")
 
@@ -483,15 +510,25 @@ def train_curriculum(cfg: CurriculumConfig):
         print(f"  Validation: {len(val_ds)} sessions")
 
         # --- Stage training data ---
-        train_ds = BashSessionDataset(
-            buffer_size=cfg.buffer_size,
-            workers=cfg.data_workers,
-            min_ops=cfg.min_ops,
-            target_ops=cfg.target_ops,
-            error_rate=stage["error_rate"],
-            base_seed=cfg.seed + stage_idx * 1000,
-            commands=stage["commands"],
-        )
+        is_recall = stage.get("recall", False)
+        if is_recall:
+            train_ds = RecallDataset(
+                buffer_size=cfg.buffer_size,
+                workers=cfg.data_workers,
+                min_cmds=3,
+                max_cmds=15,
+                base_seed=cfg.seed + stage_idx * 1000,
+            )
+        else:
+            train_ds = BashSessionDataset(
+                buffer_size=cfg.buffer_size,
+                workers=cfg.data_workers,
+                min_ops=cfg.min_ops,
+                target_ops=cfg.target_ops,
+                error_rate=stage["error_rate"],
+                base_seed=cfg.seed + stage_idx * 1000,
+                commands=stage["commands"],
+            )
         train_iter = iter(train_ds)
 
         model.train()
@@ -509,7 +546,7 @@ def train_curriculum(cfg: CurriculumConfig):
         if is_anneal:
             print(f"  Annealing: {stage_max_steps} steps, LR {stage_max_lr} -> {stage_min_lr}")
 
-        while stage_step < stage_max_steps:
+        while not passed_gate and not (is_anneal and stage_step >= stage_max_steps):
             # LR schedule
             lr = get_lr(stage_step, cfg.warmup_steps, stage_max_steps,
                         stage_max_lr, stage_min_lr)
@@ -528,6 +565,7 @@ def train_curriculum(cfg: CurriculumConfig):
 
             session_loss = 0.0
             session_tokens = 0
+            accumulated_loss = None
 
             for cmd in session:
                 ids_t = torch.tensor([cmd["ids"]], dtype=torch.long, device=device)
@@ -539,18 +577,21 @@ def train_curriculum(cfg: CurriculumConfig):
 
                 n_tokens = (labels_t != -100).sum().item()
                 if n_tokens > 0:
-                    # Scale loss by number of trained tokens so each token
-                    # contributes equally regardless of command length
-                    loss = out["loss"]
-                    loss.backward()
+                    # Accumulate loss — don't backward yet so gradients
+                    # flow through the full memory chain (full BPTT)
+                    if accumulated_loss is None:
+                        accumulated_loss = out["loss"] * n_tokens
+                    else:
+                        accumulated_loss = accumulated_loss + out["loss"] * n_tokens
                     session_loss += out["loss"].item() * n_tokens
                     session_tokens += n_tokens
 
-                # Detach memory — truncated BPTT
-                memory = out["memory"].detach()
+                # No detach — full BPTT through entire session
+                memory = out["memory"]
 
-            # Clip and step after the full session
-            if session_tokens > 0:
+            # Single backward through the full computation graph
+            if session_tokens > 0 and accumulated_loss is not None:
+                (accumulated_loss / session_tokens).backward()
                 grad_norm = torch.nn.utils.clip_grad_norm_(
                     model.parameters(), cfg.max_grad_norm)
                 optimizer.step()
@@ -617,6 +658,15 @@ def train_curriculum(cfg: CurriculumConfig):
                       f"val_ppl={loss_metrics['val_ppl']:.2f}  "
                       f"gate={gate_metrics['gate_correct']}/{gate_metrics['gate_total']}")
 
+                # Always save a resumable checkpoint
+                torch.save({
+                    "global_step": global_step,
+                    "stage": stage_idx,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "config": model_config,
+                }, str(ckpt_dir / "latest.pt"))
+
                 if is_anneal:
                     if stage_step % 1000 == 0:
                         ckpt_path = str(ckpt_dir / f"anneal_step{global_step}.pt")
@@ -649,18 +699,7 @@ def train_curriculum(cfg: CurriculumConfig):
 
         train_ds.stop()
 
-        if not passed_gate and not is_anneal:
-            print(f"\n  WARNING: Stage {stage_idx} did not pass gate after "
-                  f"{stage_max_steps} steps")
-            ckpt_path = str(ckpt_dir / f"stage{stage_idx}_timeout.pt")
-            torch.save({
-                "global_step": global_step,
-                "stage": stage_idx,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "config": model_config,
-            }, ckpt_path)
-            print(f"  Saved: {ckpt_path}")
+        # Stage only exits via gate pass (or anneal completion)
 
     # --- Done ---
     elapsed_total = time.time() - t0_global

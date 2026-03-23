@@ -113,6 +113,140 @@ def split_session_into_commands(transcript: str, tokenizer: BashTokenizer) -> li
     return commands
 
 
+def generate_recall_session(num_cmds: int, seed: int) -> list[dict]:
+    """Generate a recall session: single-letter commands with cumulative error echo.
+
+    Each command is a random letter (a-z). The response is <err> followed by
+    all letters seen so far (space-separated). This is behaviorally correct:
+    random letters aren't valid commands, so <err> is right. The cumulative
+    history forces the memory to accumulate state.
+
+    <prompt>a<eoi><err>a<eor>
+    <prompt>b<eoi><err>a b<eor>
+    <prompt>c<eoi><err>a b c<eor>
+
+    Uses <err> to keep <output> clean for real commands in later stages.
+    """
+    import random as _random
+    from generator import _gen_syllable_name_rng
+
+    rng = _random.Random(seed)
+    tok = BashTokenizer()
+
+    # Generate short random words (2-6 chars, pronounceable)
+    words = [_gen_syllable_name_rng(rng, 1) for _ in range(num_cmds)]
+
+    result = []
+    for i in range(num_cmds):
+        history = " ".join(words[:i + 1])
+        exchange = f"<prompt>{words[i]}<eoi><err>{history}<eor>"
+        ids = tok.encode(exchange)
+        # For recall: train on ALL tokens after <eoi> (the <err> + history + <eor>)
+        # No low-weighting — every token matters
+        labels = list(ids)
+        weights = [0.0] * len(ids)
+        in_prompt = False
+        for j, tid in enumerate(ids):
+            if tid == tok.prompt_id:
+                labels[j] = -100
+                in_prompt = True
+            elif in_prompt:
+                labels[j] = -100
+                if tid == tok.eoi_id:
+                    in_prompt = False
+            else:
+                weights[j] = 1.0  # full weight on everything after <eoi>
+
+        result.append({
+            "ids": ids,
+            "labels": labels,
+            "weights": weights,
+        })
+
+    return result
+
+
+class RecallDataset(IterableDataset):
+    """Infinite dataset yielding recall sessions for memory warmup.
+
+    Each session is a list of command exchanges where the expected output
+    is the cumulative history of all commands seen so far.
+    """
+
+    def __init__(
+        self,
+        buffer_size: int = 32,
+        workers: int = 4,
+        min_cmds: int = 5,
+        max_cmds: int = 20,
+        base_seed: int = 42,
+    ):
+        super().__init__()
+        self.buffer_size = buffer_size
+        self.workers = workers
+        self.min_cmds = min_cmds
+        self.max_cmds = max_cmds
+        self.base_seed = base_seed
+
+        self._queue: queue.Queue | None = None
+        self._threads: list[threading.Thread] = []
+        self._stop_event = threading.Event()
+
+    def _worker_loop(self, worker_id: int):
+        import random as _random
+        seed_counter = self.base_seed + worker_id * 10_000_000
+        rng = _random.Random(seed_counter)
+
+        while not self._stop_event.is_set():
+            seed_counter += 1
+            num_cmds = rng.randint(self.min_cmds, self.max_cmds)
+
+            try:
+                session = generate_recall_session(
+                    num_cmds, seed=seed_counter)
+            except (ValueError, KeyError):
+                continue
+
+            if not session:
+                continue
+
+            try:
+                self._queue.put(session, timeout=1.0)
+            except queue.Full:
+                if self._stop_event.is_set():
+                    return
+
+    def _start_workers(self):
+        if self._queue is not None:
+            return
+        self._stop_event.clear()
+        self._queue = queue.Queue(maxsize=self.buffer_size)
+        self._threads = []
+        for i in range(self.workers):
+            t = threading.Thread(target=self._worker_loop, args=(i,), daemon=True)
+            t.start()
+            self._threads.append(t)
+
+    def stop(self):
+        self._stop_event.set()
+        for t in self._threads:
+            t.join(timeout=5.0)
+        self._threads = []
+        self._queue = None
+
+    def __iter__(self):
+        self._start_workers()
+        while self._queue is not None:
+            try:
+                item = self._queue.get(timeout=10.0)
+            except queue.Empty:
+                continue
+            yield item
+
+    def __del__(self):
+        self.stop()
+
+
 class BashSessionDataset(IterableDataset):
     """Infinite-length dataset yielding complete sessions as command lists.
 
@@ -199,14 +333,12 @@ class BashSessionDataset(IterableDataset):
 
     def __iter__(self):
         self._start_workers()
-        try:
-            while True:
-                try:
-                    yield self._queue.get(timeout=10.0)
-                except queue.Empty:
-                    continue
-        except GeneratorExit:
-            return
+        while self._queue is not None:
+            try:
+                item = self._queue.get(timeout=10.0)
+            except queue.Empty:
+                continue
+            yield item
 
     def __del__(self):
         self.stop()
