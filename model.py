@@ -301,8 +301,12 @@ class GatedDeltaState(nn.Module):
 class TransformerBlock(nn.Module):
     def __init__(self, config: BashTransformerConfig):
         super().__init__()
+        # State read — inject memory context at this layer
+        self.state_read = GatedDeltaState(config)
+        # Self attention
         self.attn_norm = RMSNorm(config.hidden_dim, config.rms_norm_eps)
         self.attn = Attention(config)
+        # FFN
         self.ffn_norm = RMSNorm(config.hidden_dim, config.rms_norm_eps)
         self.ffn = SwiGLUFFN(config)
 
@@ -311,7 +315,12 @@ class TransformerBlock(nn.Module):
         hidden_states: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
+        state: torch.Tensor,
     ) -> torch.Tensor:
+        # Read from state: inject memory context
+        state_context, _ = self.state_read(hidden_states, state)
+        hidden_states = hidden_states + state_context
+        # Self attention + FFN
         hidden_states = hidden_states + self.attn(self.attn_norm(hidden_states), cos, sin)
         hidden_states = hidden_states + self.ffn(self.ffn_norm(hidden_states))
         return hidden_states
@@ -336,11 +345,10 @@ class BashTransformer(nn.Module):
             theta=config.rope_theta,
         )
 
-        # DeltaNet state layers — one at input (read) and one at output (write)
-        self.state_read = GatedDeltaState(config)
+        # DeltaNet state write layer — updates state from command output
         self.state_write = GatedDeltaState(config)
 
-        # Transformer layers
+        # Transformer layers (each has its own state read)
         self.layers = nn.ModuleList([
             TransformerBlock(config) for _ in range(config.num_layers)
         ])
@@ -392,7 +400,7 @@ class BashTransformer(nn.Module):
     def reset_memory(self, batch_size: int, device: torch.device,
                      dtype: torch.dtype) -> torch.Tensor:
         """Return zero-initialized state: (batch, num_heads, head_dim, head_dim)."""
-        return self.state_read.reset_state(batch_size, device, dtype)
+        return self.state_write.reset_state(batch_size, device, dtype)
 
     def forward(
         self,
@@ -419,22 +427,18 @@ class BashTransformer(nn.Module):
 
         hidden_states = self.embed_tokens(input_ids)
 
-        # Read from state: inject context from previous commands
-        state_context, _ = self.state_read(hidden_states, memory)
-        hidden_states = hidden_states + state_context
-
         # Get RoPE cos/sin
         cos, sin = self.rotary_emb(hidden_states)
 
-        # Run through transformer layers (standard causal self-attention)
+        # Run through transformer layers — each reads from state
         for layer in self.layers:
             if self._gradient_checkpointing and self.training:
                 hidden_states = checkpoint(
-                    layer, hidden_states, cos, sin,
+                    layer, hidden_states, cos, sin, memory,
                     use_reentrant=False,
                 )
             else:
-                hidden_states = layer(hidden_states, cos, sin)
+                hidden_states = layer(hidden_states, cos, sin, memory)
 
         # Write to state: update memory from this command's output
         _, new_memory = self.state_write(hidden_states, memory)
