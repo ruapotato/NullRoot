@@ -9,8 +9,9 @@ class BashTokenizer:
         self._build_vocab()
 
     def _build_vocab(self):
-        # Commands (8)
-        commands = ["ls", "cd", "pwd", "touch", "mkdir", "rm", "cat", "echo"]
+        # Commands (14)
+        commands = ["ls", "cd", "pwd", "touch", "mkdir", "rm", "cat", "echo",
+                    "cp", "mv", "head", "wc", "find", "grep"]
 
         # Letters a-z (26)
         letters = [chr(i) for i in range(ord("a"), ord("z") + 1)]

@@ -200,23 +200,24 @@ class BashSessionDataset(IterableDataset):
 
 
 class StateTrackingGenerator:
-    """Like SessionGenerator but captures filesystem state after each command."""
+    """Generates sessions with all commands, capturing filesystem state."""
 
-    ALL_COMMANDS = {"mkdir", "cd_child", "cd_up", "cd_abs", "ls", "pwd",
-                    "touch", "echo_write", "cat", "echo_append", "rm"}
+    ALL_COMMANDS = [
+        "mkdir", "cd_child", "cd_up", "cd_abs", "ls", "pwd",
+        "touch", "echo_write", "cat", "echo_append", "rm",
+        "cp", "mv", "head", "wc", "find", "grep",
+    ]
 
     def __init__(self, min_ops=10, target_ops=30, error_rate=0.0,
                  seed=None, commands=None):
         import random
         self.min_ops = min_ops
         self.target_ops = target_ops
-        self.error_rate = error_rate
         self.rng = random.Random(seed)
         self.fs = FileSystem()
         self.commands = commands if commands is not None else self.ALL_COMMANDS
 
     def generate_with_state(self) -> list[dict]:
-        """Generate session, returning command info with filesystem snapshots."""
         from generator import (_random_dirname_rng, _random_filename_rng,
                                _random_content)
         import copy
@@ -230,8 +231,7 @@ class StateTrackingGenerator:
         enabled = self.commands
 
         for _ in range(num_ops):
-            # Pick operation (simplified from SessionGenerator)
-            op = rng.choice([c for c in enabled if c != "errors"])
+            op = rng.choice(enabled)
 
             cmd_str = ""
             response_str = ""
@@ -255,14 +255,14 @@ class StateTrackingGenerator:
                 cmd_str = f"mkdir {name}"
                 err = self.fs.mkdir(name)
                 if err:
-                    is_error = True
+                    continue  # skip failed ops
 
             elif op == "touch":
                 name = _random_filename_rng(rng)
                 cmd_str = f"touch {name}"
                 err = self.fs.touch(name)
                 if err:
-                    is_error = True
+                    continue
 
             elif op == "echo_write":
                 name = _random_filename_rng(rng)
@@ -270,7 +270,7 @@ class StateTrackingGenerator:
                 cmd_str = f"echo {content} > {name}"
                 err = self.fs.write_file(name, content)
                 if err:
-                    is_error = True
+                    continue
 
             elif op == "echo_append":
                 files = self.fs.get_child_files()
@@ -282,7 +282,7 @@ class StateTrackingGenerator:
                 cmd_str = f"echo {content} >> {name}"
                 err = self.fs.append_file(name, content)
                 if err:
-                    is_error = True
+                    continue
 
             elif op == "cat":
                 files = self.fs.get_child_files()
@@ -292,9 +292,8 @@ class StateTrackingGenerator:
                 content, err = self.fs.cat(name)
                 cmd_str = f"cat {name}"
                 if err:
-                    is_error = True
-                else:
-                    response_str = content if content else ""
+                    continue
+                response_str = content if content else ""
 
             elif op == "cd_child":
                 dirs = self.fs.get_child_dirs()
@@ -326,13 +325,79 @@ class StateTrackingGenerator:
                 cmd_str = f"rm {name}"
                 self.fs.rm(name)
 
+            elif op == "cp":
+                files = self.fs.get_child_files()
+                if not files:
+                    continue
+                src = rng.choice(files)
+                dst = _random_filename_rng(rng)
+                cmd_str = f"cp {src} {dst}"
+                err = self.fs.cp(src, dst)
+                if err:
+                    continue
+
+            elif op == "mv":
+                files = self.fs.get_child_files()
+                if not files:
+                    continue
+                src = rng.choice(files)
+                dst = _random_filename_rng(rng)
+                cmd_str = f"mv {src} {dst}"
+                err = self.fs.mv(src, dst)
+                if err:
+                    continue
+
+            elif op == "head":
+                files = self.fs.get_child_files()
+                if not files:
+                    continue
+                name = rng.choice(files)
+                content, err = self.fs.head(name, n=1)
+                cmd_str = f"head {name}"
+                if err:
+                    continue
+                response_str = content if content else ""
+
+            elif op == "wc":
+                files = self.fs.get_child_files()
+                if not files:
+                    continue
+                name = rng.choice(files)
+                result, err = self.fs.wc(name)
+                cmd_str = f"wc {name}"
+                if err:
+                    continue
+                response_str = result
+
+            elif op == "find":
+                cmd_str = "find ."
+                response_str = self.fs.find(".")
+
+            elif op == "grep":
+                files = self.fs.get_child_files()
+                if not files:
+                    continue
+                name = rng.choice(files)
+                content = self.fs.files.get(self.fs.resolve(name), "")
+                if not content:
+                    continue
+                # Pick a word from the content to search for
+                words = content.split()
+                if not words:
+                    continue
+                pattern = rng.choice(words)
+                result, err = self.fs.grep(pattern, name)
+                cmd_str = f"grep {pattern} {name}"
+                if err:
+                    continue
+                response_str = result if result else ""
+
             else:
                 continue
 
             if not cmd_str:
                 continue
 
-            # Snapshot filesystem state AFTER this command
             results.append({
                 "cmd_str": cmd_str,
                 "response_str": response_str,

@@ -30,41 +30,17 @@ from generator import SessionGenerator, FileSystem
 # Stage definitions
 # ---------------------------------------------------------------------------
 
+ALL_COMMANDS = [
+    "mkdir", "cd_child", "cd_up", "cd_abs", "ls", "pwd",
+    "touch", "echo_write", "cat", "echo_append", "rm",
+    "cp", "mv", "head", "wc", "find", "grep",
+]
+
 STAGES = [
     {
-        "name": "Stage 1: mkdir + cd + ls + errors",
-        "commands": {"mkdir", "cd_child", "cd_up", "cd_abs", "ls", "errors"},
-        "error_rate": 0.05,
-    },
-    {
-        "name": "Stage 2: + pwd",
-        "commands": {"mkdir", "cd_child", "cd_up", "cd_abs", "ls", "pwd", "errors"},
-        "error_rate": 0.05,
-    },
-    {
-        "name": "Stage 3: + touch",
-        "commands": {"mkdir", "cd_child", "cd_up", "cd_abs", "ls", "pwd", "touch", "errors"},
-        "error_rate": 0.05,
-    },
-    {
-        "name": "Stage 4: + echo >",
-        "commands": {"mkdir", "cd_child", "cd_up", "cd_abs", "ls", "pwd", "touch", "echo_write", "errors"},
-        "error_rate": 0.05,
-    },
-    {
-        "name": "Stage 5: + cat",
-        "commands": {"mkdir", "cd_child", "cd_up", "cd_abs", "ls", "pwd", "touch", "echo_write", "cat", "errors"},
-        "error_rate": 0.05,
-    },
-    {
-        "name": "Stage 6: + echo >>",
-        "commands": {"mkdir", "cd_child", "cd_up", "cd_abs", "ls", "pwd", "touch", "echo_write", "cat", "echo_append", "errors"},
-        "error_rate": 0.05,
-    },
-    {
-        "name": "Stage 7: + rm",
-        "commands": {"mkdir", "cd_child", "cd_up", "cd_abs", "ls", "pwd", "touch", "echo_write", "cat", "echo_append", "rm", "errors"},
-        "error_rate": 0.05,
+        "name": "Stage 1: all commands",
+        "commands": ALL_COMMANDS,
+        "error_rate": 0.0,
     },
 ]
 
@@ -76,78 +52,77 @@ STAGES = [
 def _build_gate_tests(stage_idx):
     tests = []
 
-    if stage_idx >= 0:
-        tests.append([
-            ("mkdir gal", "<output><eor>"),
-            ("mkdir tov", "<output><eor>"),
-            ("ls", "<output>gal  tov<eor>"),
-        ])
-        tests.append([
-            ("mkdir plok", "<output><eor>"),
-            ("cd plok", "<output><eor>"),
-            ("ls", "<output><eor>"),
-            ("cd ..", "<output><eor>"),
-            ("ls", "<output>plok<eor>"),
-        ])
-        tests.append([
-            ("mkdir dex", "<output><eor>"),
-            ("cd dex", "<output><eor>"),
-            ("mkdir sub", "<output><eor>"),
-            ("mkdir rak", "<output><eor>"),
-            ("ls", "<output>rak  sub<eor>"),
-        ])
-        # Error cases
-        tests.append([
-            ("cd nofolder", "<err><eor>"),
-            ("mkdir dup", "<output><eor>"),
-            ("mkdir dup", "<err><eor>"),
-        ])
+    # mkdir + cd + ls
+    tests.append([
+        ("mkdir gal", "<output><eor>"),
+        ("mkdir tov", "<output><eor>"),
+        ("ls", "<output>gal  tov<eor>"),
+    ])
+    tests.append([
+        ("mkdir plok", "<output><eor>"),
+        ("cd plok", "<output><eor>"),
+        ("mkdir sub", "<output><eor>"),
+        ("ls", "<output>sub<eor>"),
+        ("cd ..", "<output><eor>"),
+        ("ls", "<output>plok<eor>"),
+    ])
 
-    if stage_idx >= 1:
-        tests.append([
-            ("pwd", "<output>/<eor>"),
-            ("mkdir wun", "<output><eor>"),
-            ("cd wun", "<output><eor>"),
-            ("pwd", "<output>/wun<eor>"),
-        ])
+    # pwd
+    tests.append([
+        ("pwd", "<output>/<eor>"),
+        ("mkdir wun", "<output><eor>"),
+        ("cd wun", "<output><eor>"),
+        ("pwd", "<output>/wun<eor>"),
+    ])
 
-    if stage_idx >= 2:
-        tests.append([
-            ("mkdir tdir", "<output><eor>"),
-            ("cd tdir", "<output><eor>"),
-            ("touch fob.txt", "<output><eor>"),
-            ("touch zel", "<output><eor>"),
-            ("ls", "<output>fob.txt  zel<eor>"),
-        ])
+    # echo > + cat
+    tests.append([
+        ("echo test data here > myfile", "<output><eor>"),
+        ("cat myfile", "<output>test data here<eor>"),
+    ])
 
-    if stage_idx >= 3:
-        tests.append([
-            ("echo hello world > greet.txt", "<output><eor>"),
-            ("ls", "<output>greet.txt<eor>"),
-        ])
+    # echo >> + cat
+    tests.append([
+        ("echo first line > log.txt", "<output><eor>"),
+        ("echo second line >> log.txt", "<output><eor>"),
+        ("cat log.txt", "<output>first line\nsecond line<eor>"),
+    ])
 
-    if stage_idx >= 4:
-        tests.append([
-            ("echo test data here > myfile", "<output><eor>"),
-            ("cat myfile", "<output>test data here<eor>"),
-        ])
+    # rm
+    tests.append([
+        ("echo data > tmp.dat", "<output><eor>"),
+        ("ls", "<output>tmp.dat<eor>"),
+        ("rm tmp.dat", "<output><eor>"),
+        ("ls", "<output><eor>"),
+    ])
 
-    if stage_idx >= 5:
-        tests.append([
-            ("echo first line > log.txt", "<output><eor>"),
-            ("echo second line >> log.txt", "<output><eor>"),
-            ("cat log.txt", "<output>first line\nsecond line<eor>"),
-        ])
+    # cp
+    tests.append([
+        ("echo original > src.txt", "<output><eor>"),
+        ("cp src.txt dst.txt", "<output><eor>"),
+        ("cat dst.txt", "<output>original<eor>"),
+    ])
 
-    if stage_idx >= 6:
-        tests.append([
-            ("echo data > tmp.dat", "<output><eor>"),
-            ("ls", "<output>tmp.dat<eor>"),
-            ("rm tmp.dat", "<output><eor>"),
-            ("ls", "<output><eor>"),
-        ])
+    # mv
+    tests.append([
+        ("echo moveme > old.txt", "<output><eor>"),
+        ("mv old.txt new.txt", "<output><eor>"),
+        ("cat new.txt", "<output>moveme<eor>"),
+        ("ls", "<output>new.txt<eor>"),
+    ])
 
-    # Error cases covered in stage 0 gate tests above
+    # head
+    tests.append([
+        ("echo first line > multi.txt", "<output><eor>"),
+        ("echo second line >> multi.txt", "<output><eor>"),
+        ("head multi.txt", "<output>first line<eor>"),
+    ])
+
+    # wc
+    tests.append([
+        ("echo hello world > count.txt", "<output><eor>"),
+        ("wc count.txt", "<output>1 2 11 count.txt<eor>"),
+    ])
 
     return tests
 
@@ -281,6 +256,12 @@ def _execute_cmd_on_fs(fs, cmd_str):
         pass  # read-only
     elif cmd == "rm" and len(parts) > 1:
         fs.rm(parts[1])
+    elif cmd == "cp" and len(parts) > 2:
+        fs.cp(parts[1], parts[2])
+    elif cmd == "mv" and len(parts) > 2:
+        fs.mv(parts[1], parts[2])
+    elif cmd in ("head", "wc", "find", "grep"):
+        pass  # read-only
 
 
 # ---------------------------------------------------------------------------

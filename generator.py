@@ -260,6 +260,72 @@ class FileSystem:
             return None
         return f"bash: cd: {path}: no such file or directory"
 
+    def cp(self, src: str, dst: str) -> str | None:
+        """Copy a file."""
+        src_abs = self.resolve(src)
+        if src_abs not in self.files:
+            return f"cp: cannot stat '{src}': no such file or directory"
+        dst_abs = self.resolve(dst)
+        dst_parent = self.parent(dst_abs)
+        if not self.exists_dir(dst_parent):
+            return f"cp: cannot create '{dst}': no such file or directory"
+        self.files[dst_abs] = self.files[src_abs]
+        return None
+
+    def mv(self, src: str, dst: str) -> str | None:
+        """Move/rename a file."""
+        src_abs = self.resolve(src)
+        if src_abs not in self.files:
+            return f"mv: cannot stat '{src}': no such file or directory"
+        dst_abs = self.resolve(dst)
+        dst_parent = self.parent(dst_abs)
+        if not self.exists_dir(dst_parent):
+            return f"mv: cannot move '{src}': no such file or directory"
+        self.files[dst_abs] = self.files[src_abs]
+        del self.files[src_abs]
+        return None
+
+    def head(self, name: str, n: int = 1) -> tuple[str | None, str | None]:
+        """Return first n lines of a file. Returns (content, error)."""
+        abspath = self.resolve(name)
+        if abspath not in self.files:
+            return None, f"head: cannot open '{name}': no such file or directory"
+        lines = self.files[abspath].split("\n")
+        return "\n".join(lines[:n]), None
+
+    def wc(self, name: str) -> tuple[str | None, str | None]:
+        """Return line/word/char count. Returns (result, error)."""
+        abspath = self.resolve(name)
+        if abspath not in self.files:
+            return None, f"wc: {name}: no such file or directory"
+        content = self.files[abspath]
+        lines = content.count("\n") + (1 if content else 0)
+        words = len(content.split())
+        chars = len(content)
+        return f"{lines} {words} {chars} {name}", None
+
+    def find(self, path: str = ".") -> str:
+        """Find all files/dirs under path, return one per line."""
+        base = self.resolve(path)
+        results = [base]
+        prefix = base.rstrip("/") + "/"
+        for d in sorted(self.dirs):
+            if d.startswith(prefix):
+                results.append(d)
+        for f in sorted(self.files):
+            if f.startswith(prefix):
+                results.append(f)
+        return "\n".join(results)
+
+    def grep(self, pattern: str, name: str) -> tuple[str | None, str | None]:
+        """Search file for lines containing pattern. Returns (matches, error)."""
+        abspath = self.resolve(name)
+        if abspath not in self.files:
+            return None, f"grep: {name}: no such file or directory"
+        content = self.files[abspath]
+        matches = [line for line in content.split("\n") if pattern in line]
+        return "\n".join(matches), None
+
     def get_child_dirs(self) -> list[str]:
         """Get names of immediate child directories of cwd."""
         children = []
