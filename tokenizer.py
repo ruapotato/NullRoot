@@ -1,6 +1,6 @@
 """
-Hand-defined tokenizer for bash terminal simulation.
-~85 explicit tokens, no BPE/subword tokenization.
+Hand-defined tokenizer for NullRoot bash simulation.
+Covers filesystem ops, variables, math, control flow, and scripting.
 """
 
 
@@ -9,9 +9,18 @@ class BashTokenizer:
         self._build_vocab()
 
     def _build_vocab(self):
-        # Commands (14)
-        commands = ["ls", "cd", "pwd", "touch", "mkdir", "rm", "cat", "echo",
-                    "cp", "mv", "head", "wc", "find", "grep"]
+        # Filesystem commands (14)
+        fs_commands = [
+            "ls", "cd", "pwd", "touch", "mkdir", "rm", "cat", "echo",
+            "cp", "mv", "head", "wc", "find", "grep",
+        ]
+
+        # Programming commands (5)
+        prog_commands = ["sh", "export", "exit", "test", "expr"]
+
+        # Control flow keywords (10)
+        control = ["if", "then", "else", "fi", "while", "do", "done",
+                    "for", "in", "true"]
 
         # Letters a-z (26)
         letters = [chr(i) for i in range(ord("a"), ord("z") + 1)]
@@ -19,18 +28,29 @@ class BashTokenizer:
         # Digits 0-9 (10)
         digits = [str(i) for i in range(10)]
 
-        # Punctuation (9)
-        punctuation = ["/", ".", "_", "-", ">", ">>", '"', " ", "\n"]
+        # Punctuation (17)
+        punctuation = [
+            "/", ".", "_", "-", ">", ">>",
+            '"', " ", "\n", "\\",
+            "$", "=", "+", "*", ";",
+            "?", "!",
+        ]
+
+        # Logical operators (2)
+        logical = ["&&", "||"]
 
         # Special tokens (9)
-        special = ["<prompt>", "<eoi>", "<output>", "<err>", "<eor>", "<pad>", "<eos>",
-                   "<state>", "<nop>"]
+        special = [
+            "<prompt>", "<eoi>", "<output>", "<err>", "<eor>",
+            "<pad>", "<eos>", "<state>", "<nop>",
+        ]
 
         # Shell chrome (3)
         chrome = ["@", ":", "#"]
 
         # Build ordered vocabulary
-        all_tokens = commands + letters + digits + punctuation + special + chrome
+        all_tokens = (fs_commands + prog_commands + control + letters +
+                      digits + punctuation + logical + special + chrome)
 
         self.token_to_id = {tok: i for i, tok in enumerate(all_tokens)}
         self.id_to_token = {i: tok for i, tok in enumerate(all_tokens)}
@@ -40,14 +60,14 @@ class BashTokenizer:
         self.pad_id = self.token_to_id["<pad>"]
         self.eos_id = self.token_to_id["<eos>"]
         self.prompt_id = self.token_to_id["<prompt>"]
-        self.eoi_id = self.token_to_id["<eoi>"]     # end of input
+        self.eoi_id = self.token_to_id["<eoi>"]
         self.output_id = self.token_to_id["<output>"]
         self.err_id = self.token_to_id["<err>"]
-        self.eor_id = self.token_to_id["<eor>"]     # end of response
+        self.eor_id = self.token_to_id["<eor>"]
         self.newline_id = self.token_to_id["\n"]
         self.space_id = self.token_to_id[" "]
-        self.state_id = self.token_to_id["<state>"]   # state patch begins
-        self.nop_id = self.token_to_id["<nop>"]       # no state change
+        self.state_id = self.token_to_id["<state>"]
+        self.nop_id = self.token_to_id["<nop>"]
 
         # Precompute multi-char tokens sorted longest-first for greedy matching
         self._multi_char_tokens = sorted(
@@ -99,32 +119,47 @@ class BashTokenizer:
 if __name__ == "__main__":
     tok = BashTokenizer()
     print(f"Vocab size: {tok.vocab_size}")
-    print(f"Tokens: {list(tok.token_to_id.keys())}")
-    print()
 
     # Round-trip tests
     tests = [
-        "<prompt>ls\n<output>file1.txt\n",
-        "<prompt>cd /home\n<output>\n",
-        "<prompt>echo hello > test.txt\n<output>\n",
-        '<prompt>echo "hello"\n<output>hello\n',
-        "<prompt>cat nofile\n<err>cat: nofile: no such file\n",
-        "<prompt>mkdir test_dir\n<output>\n",
-        "<prompt>pwd\n<output>/home/user\n",
-        "user@host:/home#",
+        "<prompt>mkdir test_dir<eoi><output><eor>",
+        "<prompt>echo hello > test.txt<eoi><output><eor>",
+        "<prompt>cat test.txt<eoi><output>hello<eor>",
+        # Variables
+        "<prompt>x=42<eoi><output><eor>",
+        "<prompt>echo $x<eoi><output>42<eor>",
+        # Math
+        "<prompt>expr 3 + 5<eoi><output>8<eor>",
+        # Control flow
+        "<prompt>if test true; then echo yes; fi<eoi><output>yes<eor>",
+        "<prompt>while true; do echo loop; done<eoi>",
+        "<prompt>for x in a b c; do echo $x; done<eoi>",
+        # Script
+        "<prompt>sh script.sh<eoi><output>hello<eor>",
+        # Logical
+        "<prompt>true && echo ok<eoi><output>ok<eor>",
+        # State
+        "<state>@/#/:foo bar#/foo:$x=5$?=0<eor>",
     ]
 
     all_pass = True
     for t in tests:
-        ids = tok.encode(t)
-        decoded = tok.decode(ids)
-        ok = decoded == t
-        if not ok:
+        try:
+            ids = tok.encode(t)
+            decoded = tok.decode(ids)
+            ok = decoded == t
+            if not ok:
+                all_pass = False
+            status = "OK" if ok else "FAIL"
+            print(f"[{status}] {t[:70]}")
+            if not ok:
+                print(f"  Got: {decoded[:70]}")
+        except ValueError as e:
             all_pass = False
-        status = "OK" if ok else "FAIL"
-        print(f"[{status}] {t!r}")
-        if not ok:
-            print(f"  Got: {decoded!r}")
-        print(f"  IDs ({len(ids)}): {ids}")
+            print(f"[ERR] {t[:70]}")
+            print(f"  {e}")
 
-    print(f"\nAll tests passed: {all_pass}")
+    print(f"\nAll passed: {all_pass}")
+    print(f"\nAll tokens ({tok.vocab_size}):")
+    for i in range(tok.vocab_size):
+        print(f"  {i:3d}: {tok.id_to_token[i]!r}")

@@ -130,7 +130,7 @@ def random_dirname() -> str:
 
 
 class FileSystem:
-    """In-memory filesystem tracking dirs and files with content."""
+    """In-memory filesystem + shell state: dirs, files, variables, exit status."""
 
     def __init__(self):
         # dirs: set of absolute paths (strings), always starts with "/"
@@ -138,6 +138,9 @@ class FileSystem:
         # files: dict of absolute path -> content string
         self.files: dict[str, str] = {}
         self.cwd = "/"
+        # Shell variables
+        self.vars: dict[str, str] = {}
+        self.exit_status = 0
 
     def resolve(self, path: str) -> str:
         """Resolve a path relative to cwd into an absolute path."""
@@ -326,6 +329,188 @@ class FileSystem:
         matches = [line for line in content.split("\n") if pattern in line]
         return "\n".join(matches), None
 
+    # --- Variables ---
+
+    def set_var(self, name: str, value: str):
+        """Set a shell variable."""
+        self.vars[name] = value
+
+    def get_var(self, name: str) -> str:
+        """Get a variable value, empty string if unset."""
+        if name == "?":
+            return str(self.exit_status)
+        return self.vars.get(name, "")
+
+    def expand_vars(self, text: str) -> str:
+        """Replace $VAR references with their values."""
+        result = []
+        i = 0
+        while i < len(text):
+            if text[i] == "$":
+                # Read variable name
+                j = i + 1
+                while j < len(text) and (text[j].isalnum() or text[j] in "_?"):
+                    j += 1
+                var_name = text[i+1:j]
+                if var_name:
+                    result.append(self.get_var(var_name))
+                else:
+                    result.append("$")
+                i = j
+            else:
+                result.append(text[i])
+                i += 1
+        return "".join(result)
+
+    # --- Math ---
+
+    def eval_math(self, expr_str: str) -> str | None:
+        """Evaluate simple math: supports +, -, * on integers."""
+        expr_str = self.expand_vars(expr_str.strip())
+        try:
+            # Simple tokenized evaluation (no eval() for safety)
+            tokens = expr_str.split()
+            if len(tokens) == 1:
+                return str(int(tokens[0]))
+            if len(tokens) == 3:
+                a, op, b = int(tokens[0]), tokens[1], int(tokens[2])
+                if op == "+": return str(a + b)
+                if op == "-": return str(a - b)
+                if op == "*": return str(a * b)
+            return None
+        except (ValueError, IndexError):
+            return None
+
+    # --- Script execution ---
+
+    def execute_script(self, content: str) -> tuple[str, bool]:
+        """Execute a script (file content) line by line.
+
+        Returns (combined_output, success). Each line is parsed and
+        executed against this filesystem. Variable substitution is applied.
+        """
+        lines = content.split("\n")
+        outputs = []
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            result = self.execute_command(line)
+            if result:
+                outputs.append(result)
+        return "\n".join(outputs), True
+
+    def execute_command(self, cmd_str: str) -> str:
+        """Execute a single command string, return output text."""
+        cmd_str = self.expand_vars(cmd_str)
+        parts = cmd_str.split()
+        if not parts:
+            return ""
+
+        cmd = parts[0]
+
+        if cmd == "echo" and (">" in parts or ">>" in parts):
+            if ">>" in parts:
+                idx = parts.index(">>")
+                content = " ".join(parts[1:idx])
+                self.append_file(parts[idx + 1], content)
+            else:
+                idx = parts.index(">")
+                content = " ".join(parts[1:idx])
+                self.write_file(parts[idx + 1], content)
+            return ""
+        elif cmd == "echo":
+            text = " ".join(parts[1:])
+            return text
+        elif cmd == "mkdir" and len(parts) > 1:
+            self.mkdir(parts[1])
+            return ""
+        elif cmd == "cd" and len(parts) > 1:
+            self.cd(parts[1])
+            return ""
+        elif cmd == "ls":
+            entries = self.list_dir(self.cwd)
+            return "  ".join(entries)
+        elif cmd == "pwd":
+            return self.cwd
+        elif cmd == "cat" and len(parts) > 1:
+            content, err = self.cat(parts[1])
+            return content if content else ""
+        elif cmd == "touch" and len(parts) > 1:
+            self.touch(parts[1])
+            return ""
+        elif cmd == "rm" and len(parts) > 1:
+            self.rm(parts[1])
+            return ""
+        elif cmd == "cp" and len(parts) > 2:
+            self.cp(parts[1], parts[2])
+            return ""
+        elif cmd == "mv" and len(parts) > 2:
+            self.mv(parts[1], parts[2])
+            return ""
+        elif cmd == "head" and len(parts) > 1:
+            content, err = self.head(parts[1])
+            return content if content else ""
+        elif cmd == "wc" and len(parts) > 1:
+            result, err = self.wc(parts[1])
+            return result if result else ""
+        elif cmd == "find":
+            path = parts[1] if len(parts) > 1 else "."
+            return self.find(path)
+        elif cmd == "grep" and len(parts) > 2:
+            result, err = self.grep(parts[1], parts[2])
+            return result if result else ""
+        elif cmd == "expr" and len(parts) > 1:
+            result = self.eval_math(" ".join(parts[1:]))
+            return result if result else ""
+        elif cmd == "export" and len(parts) > 1 and "=" in parts[1]:
+            name, _, value = parts[1].partition("=")
+            self.set_var(name, value)
+            return ""
+        elif cmd == "test":
+            return self._eval_test(parts[1:])
+        elif cmd == "true":
+            self.exit_status = 0
+            return ""
+        elif cmd == "sh" and len(parts) > 1:
+            content, err = self.cat(parts[1])
+            if err or content is None:
+                return ""
+            output, _ = self.execute_script(content)
+            return output
+        elif "=" in cmd and not cmd.startswith("="):
+            # Variable assignment: x=5
+            name, _, value = cmd.partition("=")
+            if value:
+                value = self.expand_vars(value)
+            self.set_var(name, value)
+            return ""
+        return ""
+
+    def _eval_test(self, args: list[str]) -> str:
+        """Evaluate test expressions. Sets exit_status."""
+        if not args:
+            self.exit_status = 1
+            return ""
+        if args[0] == "-f" and len(args) > 1:
+            # test -f FILE: true if file exists
+            self.exit_status = 0 if self.exists_file(self.resolve(args[1])) else 1
+        elif args[0] == "-d" and len(args) > 1:
+            # test -d DIR: true if directory exists
+            self.exit_status = 0 if self.exists_dir(self.resolve(args[1])) else 1
+        elif len(args) == 3 and args[1] == "=":
+            # test "a" = "b"
+            self.exit_status = 0 if args[0] == args[2] else 1
+        elif len(args) == 3 and args[1] == "!=":
+            self.exit_status = 0 if args[0] != args[2] else 1
+        elif args[0] == "true":
+            self.exit_status = 0
+        elif args[0] == "false":
+            self.exit_status = 1
+        else:
+            self.exit_status = 1
+        return ""
+
     def get_child_dirs(self) -> list[str]:
         """Get names of immediate child directories of cwd."""
         children = []
@@ -362,8 +547,13 @@ class FileSystem:
     #   > = file content
 
     def serialize_state(self) -> str:
-        """Serialize full filesystem state to a compact token string."""
+        """Serialize full state: CWD + variables + filesystem."""
         parts = [f"@{self.cwd}"]
+
+        # Exit status and variables
+        parts.append(f"$?={self.exit_status}")
+        for k in sorted(self.vars):
+            parts.append(f"${k}={self.vars[k]}")
 
         # All directories with their children
         for d in sorted(self.dirs):
@@ -371,9 +561,9 @@ class FileSystem:
             children_str = " ".join(children) if children else ""
             parts.append(f"{d}:{children_str}")
 
-        # All files with content
+        # All files with content (escape newlines: real \n → two chars \n)
         for f in sorted(self.files):
-            content = self.files[f]
+            content = self.files[f].replace("\\", "\\\\").replace("\n", "\\n")
             parts.append(f"{f}>{content}")
 
         return "#".join(parts)
@@ -422,6 +612,11 @@ class FileSystem:
                 continue
             if part.startswith("@"):
                 entries["@"] = part
+            elif part.startswith("$"):
+                # Variable: $name=value or $?=0
+                eq_idx = part.index("=") if "=" in part else len(part)
+                key = part[:eq_idx]
+                entries[key] = part
             elif ">" in part:
                 path = part[:part.index(">")]
                 entries[path] = part
@@ -429,7 +624,6 @@ class FileSystem:
                 path = part[:part.index(":")]
                 entries[path] = part
             elif part.startswith("-"):
-                # Deletion marker
                 entries[part] = part
         return entries
 
@@ -451,14 +645,18 @@ class FileSystem:
             else:
                 old_entries[key] = value
 
-        # Reconstruct: CWD first, then dirs sorted, then files sorted
+        # Reconstruct: CWD, variables, dirs, files
         parts = []
         if "@" in old_entries:
             parts.append(old_entries.pop("@"))
 
-        dir_entries = sorted((k, v) for k, v in old_entries.items() if ":" in v)
+        var_entries = sorted((k, v) for k, v in old_entries.items() if k.startswith("$"))
+        dir_entries = sorted((k, v) for k, v in old_entries.items()
+                             if ":" in v and not k.startswith("$"))
         file_entries = sorted((k, v) for k, v in old_entries.items() if ">" in v)
 
+        for _, v in var_entries:
+            parts.append(v)
         for _, v in dir_entries:
             parts.append(v)
         for _, v in file_entries:

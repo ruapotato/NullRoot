@@ -1,41 +1,26 @@
 """
-Dataset for bash terminal with state patches.
+Dataset for NullRoot with state patches.
 
-Each training sample is one command exchange with state:
-  [state_string] <prompt>cmd<eoi> <output>response<eor> <state>patch<eor>
-
-The model sees the current state + command, produces the response + state patch.
-The patch is applied to produce the state for the next command.
-
-Labels mask everything before <eoi> (state + command are input context).
-The model trains on predicting the response AND the state patch.
+Each training sample: [state] <prompt>cmd<eoi> → <output>response<eor> <state>patch<eor>
+Generates deep filesystems with all commands: filesystem ops, variables, math, scripts.
 """
 
 import threading
 import queue
 import json
+import copy
+import random
 import torch
 from torch.utils.data import IterableDataset
 
 from tokenizer import BashTokenizer
-from generator import SessionGenerator, FileSystem
+from generator import FileSystem, _gen_syllable_name_rng, _random_filename_rng, _random_content
 
 
 def build_session_samples(transcript_commands: list[dict],
                           tok: BashTokenizer) -> list[dict]:
-    """Build training samples from a session with state tracking.
-
-    Each command gets: state input + command + response + state patch.
-
-    Args:
-        transcript_commands: list of dicts with 'cmd_str', 'response_str',
-                            'is_error', and 'fs' (FileSystem snapshot after cmd)
-        tok: tokenizer
-
-    Returns:
-        list of dicts with 'ids', 'labels', 'weights', 'state_after'
-    """
-    state_str = ""  # empty state at session start
+    """Build training samples from a session with state tracking."""
+    state_str = ""
     samples = []
 
     for cmd_info in transcript_commands:
@@ -43,11 +28,6 @@ def build_session_samples(transcript_commands: list[dict],
         response_str = cmd_info["response_str"]
         is_error = cmd_info["is_error"]
         fs = cmd_info["fs"]
-
-        # Build the full sequence:
-        # [state_string] <prompt>cmd<eoi> <output>response<eor> <state>patch<eor>
-        # or for errors:
-        # [state_string] <prompt>cmd<eoi> <err><eor> <state>patch<eor>
 
         new_state_str = fs.serialize_state()
         patch_str = fs.compute_patch(state_str) if state_str else new_state_str
@@ -66,7 +46,7 @@ def build_session_samples(transcript_commands: list[dict],
         else:
             output_part = "<output><eor>"
 
-        # Build state patch portion (trained)
+        # Build state patch (trained)
         if patch_str:
             state_part = f"<state>{patch_str}<eor>"
         else:
@@ -80,11 +60,9 @@ def build_session_samples(transcript_commands: list[dict],
             state_str = new_state_str
             continue
 
-        # Labels: mask input portion, train on output + state patch
+        # Labels: mask input, train on output + patch
         labels = list(ids)
         weights = [1.0] * len(ids)
-
-        # Find where the output starts (after <eoi>)
         in_input = True
         for j, tid in enumerate(ids):
             if in_input:
@@ -104,64 +82,353 @@ def build_session_samples(transcript_commands: list[dict],
     return samples
 
 
+# ---------------------------------------------------------------------------
+# Session generator with full command coverage
+# ---------------------------------------------------------------------------
+
+class StateTrackingGenerator:
+    """Generates training sessions with deep filesystems, variables, math, scripts."""
+
+    # Weighted command pool — controls distribution
+    COMMAND_WEIGHTS = {
+        # Filesystem (heavily weighted — core skill)
+        "mkdir": 12, "cd_child": 10, "cd_up": 6, "cd_abs": 5,
+        "ls": 15, "pwd": 5,
+        "touch": 8, "echo_write": 12, "echo_append": 6,
+        "cat": 12, "rm": 4, "cp": 4, "mv": 4,
+        "head": 3, "wc": 3, "find": 3, "grep": 3,
+        # Variables + math
+        "var_set": 8, "var_echo": 6, "expr_math": 6,
+        "export": 3,
+        # Scripts
+        "write_script": 5, "run_script": 4,
+    }
+
+    def __init__(self, min_ops=50, target_ops=150, seed=None, commands=None):
+        self.min_ops = min_ops
+        self.target_ops = target_ops
+        self.rng = random.Random(seed)
+        self.fs = FileSystem()
+        if commands:
+            self.weights = {k: v for k, v in self.COMMAND_WEIGHTS.items()
+                           if k in commands}
+        else:
+            self.weights = dict(self.COMMAND_WEIGHTS)
+
+    def generate_with_state(self) -> list[dict]:
+        num_ops = max(self.min_ops, min(
+            self.target_ops * 2,
+            int(self.rng.gauss(self.target_ops, self.target_ops * 0.3))))
+
+        results = []
+        rng = self.rng
+        ops = list(self.weights.keys())
+        wts = list(self.weights.values())
+
+        for _ in range(num_ops):
+            op = rng.choices(ops, weights=wts, k=1)[0]
+            cmd_info = self._exec_op(op, rng)
+            if cmd_info:
+                results.append(cmd_info)
+
+        return results
+
+    def _exec_op(self, op, rng) -> dict | None:
+        """Execute one operation, return command info or None if skipped."""
+        fs = self.fs
+        cmd_str = ""
+        response_str = ""
+        is_error = False
+
+        # --- Filesystem ops ---
+        if op == "ls":
+            entries = fs.list_dir(fs.cwd)
+            cmd_str = "ls"
+            response_str = "  ".join(entries) if entries else ""
+
+        elif op == "pwd":
+            cmd_str = "pwd"
+            response_str = fs.cwd
+
+        elif op == "mkdir":
+            name = _gen_syllable_name_rng(rng)
+            for _ in range(10):
+                if not fs.exists(fs.resolve(name)):
+                    break
+                name = _gen_syllable_name_rng(rng)
+            cmd_str = f"mkdir {name}"
+            err = fs.mkdir(name)
+            if err:
+                return None
+
+        elif op == "touch":
+            name = _random_filename_rng(rng)
+            cmd_str = f"touch {name}"
+            err = fs.touch(name)
+            if err:
+                return None
+
+        elif op == "echo_write":
+            name = _random_filename_rng(rng)
+            content = _random_content(rng)
+            cmd_str = f"echo {content} > {name}"
+            err = fs.write_file(name, content)
+            if err:
+                return None
+
+        elif op == "echo_append":
+            files = fs.get_child_files()
+            if files and rng.random() < 0.7:
+                name = rng.choice(files)
+            else:
+                name = _random_filename_rng(rng)
+            content = _random_content(rng)
+            cmd_str = f"echo {content} >> {name}"
+            err = fs.append_file(name, content)
+            if err:
+                return None
+
+        elif op == "cat":
+            files = fs.get_child_files()
+            if not files:
+                return None
+            name = rng.choice(files)
+            content, err = fs.cat(name)
+            cmd_str = f"cat {name}"
+            if err:
+                return None
+            response_str = content if content else ""
+
+        elif op == "cd_child":
+            dirs = fs.get_child_dirs()
+            if not dirs:
+                return None
+            name = rng.choice(dirs)
+            cmd_str = f"cd {name}"
+            fs.cd(name)
+
+        elif op == "cd_up":
+            if fs.cwd == "/":
+                return None
+            cmd_str = "cd .."
+            fs.cd("..")
+
+        elif op == "cd_abs":
+            dirs = fs.get_all_dirs()
+            if not dirs:
+                return None
+            target = rng.choice(dirs)
+            cmd_str = f"cd {target}"
+            fs.cd(target)
+
+        elif op == "rm":
+            files = fs.get_child_files()
+            if not files:
+                return None
+            name = rng.choice(files)
+            cmd_str = f"rm {name}"
+            fs.rm(name)
+
+        elif op == "cp":
+            files = fs.get_child_files()
+            if not files:
+                return None
+            src = rng.choice(files)
+            dst = _random_filename_rng(rng)
+            cmd_str = f"cp {src} {dst}"
+            err = fs.cp(src, dst)
+            if err:
+                return None
+
+        elif op == "mv":
+            files = fs.get_child_files()
+            if not files:
+                return None
+            src = rng.choice(files)
+            dst = _random_filename_rng(rng)
+            cmd_str = f"mv {src} {dst}"
+            err = fs.mv(src, dst)
+            if err:
+                return None
+
+        elif op == "head":
+            files = fs.get_child_files()
+            if not files:
+                return None
+            name = rng.choice(files)
+            content, err = fs.head(name, n=1)
+            cmd_str = f"head {name}"
+            if err:
+                return None
+            response_str = content if content else ""
+
+        elif op == "wc":
+            files = fs.get_child_files()
+            if not files:
+                return None
+            name = rng.choice(files)
+            result, err = fs.wc(name)
+            cmd_str = f"wc {name}"
+            if err:
+                return None
+            response_str = result
+
+        elif op == "find":
+            cmd_str = "find ."
+            response_str = fs.find(".")
+
+        elif op == "grep":
+            files = fs.get_child_files()
+            if not files:
+                return None
+            name = rng.choice(files)
+            content = fs.files.get(fs.resolve(name), "")
+            if not content:
+                return None
+            words = content.split()
+            if not words:
+                return None
+            pattern = rng.choice(words)
+            result, err = fs.grep(pattern, name)
+            cmd_str = f"grep {pattern} {name}"
+            if err:
+                return None
+            response_str = result if result else ""
+
+        # --- Variable ops ---
+        elif op == "var_set":
+            name = _gen_syllable_name_rng(rng, 1)
+            # Mix of string and numeric values
+            if rng.random() < 0.5:
+                value = str(rng.randint(0, 99))
+            else:
+                value = _gen_syllable_name_rng(rng, 1)
+            cmd_str = f"{name}={value}"
+            fs.set_var(name, value)
+
+        elif op == "var_echo":
+            if not fs.vars:
+                return None
+            var_name = rng.choice(list(fs.vars.keys()))
+            cmd_str = f"echo ${var_name}"
+            response_str = fs.get_var(var_name)
+
+        elif op == "expr_math":
+            a = rng.randint(1, 50)
+            b = rng.randint(1, 50)
+            op_sym = rng.choice(["+", "-", "*"])
+            cmd_str = f"expr {a} {op_sym} {b}"
+            result = fs.eval_math(f"{a} {op_sym} {b}")
+            response_str = result if result else "0"
+
+        elif op == "export":
+            name = _gen_syllable_name_rng(rng, 1)
+            value = _gen_syllable_name_rng(rng, 1)
+            cmd_str = f"export {name}={value}"
+            fs.set_var(name, value)
+
+        # --- Script ops ---
+        elif op == "write_script":
+            # Write a small script: 2-4 commands
+            name = _gen_syllable_name_rng(rng, 1) + ".sh"
+            script_lines = []
+            for _ in range(rng.randint(2, 4)):
+                line = self._random_script_line(rng)
+                if line:
+                    script_lines.append(line)
+            if not script_lines:
+                return None
+            content = "\\n".join(script_lines)
+            cmd_str = f'echo "{content}" > {name}'
+            # Store with actual newlines
+            fs.write_file(name, "\n".join(script_lines))
+
+        elif op == "run_script":
+            files = fs.get_child_files()
+            scripts = [f for f in files if f.endswith(".sh")]
+            if not scripts:
+                return None
+            name = rng.choice(scripts)
+            content, err = fs.cat(name)
+            if err or not content:
+                return None
+            cmd_str = f"sh {name}"
+            output, _ = fs.execute_script(content)
+            response_str = output
+
+        else:
+            return None
+
+        if not cmd_str:
+            return None
+
+        return {
+            "cmd_str": cmd_str,
+            "response_str": response_str,
+            "is_error": is_error,
+            "fs": copy.deepcopy(fs),
+        }
+
+    def _random_script_line(self, rng) -> str | None:
+        """Generate a random script line."""
+        kind = rng.choice(["echo", "mkdir", "touch", "var", "cd", "ls"])
+        if kind == "echo":
+            word = _gen_syllable_name_rng(rng, 1)
+            return f"echo {word}"
+        elif kind == "mkdir":
+            name = _gen_syllable_name_rng(rng, 1)
+            return f"mkdir {name}"
+        elif kind == "touch":
+            name = _gen_syllable_name_rng(rng, 1)
+            return f"touch {name}"
+        elif kind == "var":
+            name = _gen_syllable_name_rng(rng, 1)
+            val = str(rng.randint(0, 99))
+            return f"{name}={val}"
+        elif kind == "cd":
+            dirs = self.fs.get_child_dirs()
+            if dirs:
+                return f"cd {rng.choice(dirs)}"
+            return "pwd"
+        elif kind == "ls":
+            return "ls"
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Dataset
+# ---------------------------------------------------------------------------
+
 class BashSessionDataset(IterableDataset):
-    """Infinite dataset yielding sessions with state patches.
-
-    Each session is a list of command samples, each containing:
-    - ids: [state + prompt + response + patch] token ids
-    - labels: masked on input, trained on output + patch
-    - weights: per-token loss weights
-    """
-
-    def __init__(
-        self,
-        buffer_size: int = 32,
-        workers: int = 4,
-        min_ops: int = 10,
-        target_ops: int = 30,
-        error_rate: float = 0.0,
-        base_seed: int = 42,
-        commands: set[str] | None = None,
-    ):
+    def __init__(self, buffer_size=32, workers=4, min_ops=50, target_ops=150,
+                 base_seed=42, commands=None):
         super().__init__()
         self.buffer_size = buffer_size
         self.workers = workers
         self.min_ops = min_ops
         self.target_ops = target_ops
-        self.error_rate = error_rate
         self.base_seed = base_seed
         self.commands = commands
-
         self.tokenizer = BashTokenizer()
-
-        self._queue: queue.Queue | None = None
-        self._threads: list[threading.Thread] = []
+        self._queue = None
+        self._threads = []
         self._stop_event = threading.Event()
 
-    def _worker_loop(self, worker_id: int):
+    def _worker_loop(self, worker_id):
         seed_counter = self.base_seed + worker_id * 10_000_000
         tok = BashTokenizer()
-
         while not self._stop_event.is_set():
             seed_counter += 1
-
             gen = StateTrackingGenerator(
-                min_ops=self.min_ops,
-                target_ops=self.target_ops,
-                error_rate=self.error_rate,
-                seed=seed_counter,
-                commands=self.commands,
-            )
-            cmd_list = gen.generate_with_state()
-
+                min_ops=self.min_ops, target_ops=self.target_ops,
+                seed=seed_counter, commands=self.commands)
             try:
-                samples = build_session_samples(cmd_list, tok)
+                cmds = gen.generate_with_state()
+                samples = build_session_samples(cmds, tok)
             except (ValueError, KeyError):
                 continue
-
             if not samples:
                 continue
-
             try:
                 self._queue.put(samples, timeout=1.0)
             except queue.Full:
@@ -199,248 +466,52 @@ class BashSessionDataset(IterableDataset):
         self.stop()
 
 
-class StateTrackingGenerator:
-    """Generates sessions with all commands, capturing filesystem state."""
-
-    ALL_COMMANDS = [
-        "mkdir", "cd_child", "cd_up", "cd_abs", "ls", "pwd",
-        "touch", "echo_write", "cat", "echo_append", "rm",
-        "cp", "mv", "head", "wc", "find", "grep",
-    ]
-
-    def __init__(self, min_ops=10, target_ops=30, error_rate=0.0,
-                 seed=None, commands=None):
-        import random
-        self.min_ops = min_ops
-        self.target_ops = target_ops
-        self.rng = random.Random(seed)
-        self.fs = FileSystem()
-        self.commands = commands if commands is not None else self.ALL_COMMANDS
-
-    def generate_with_state(self) -> list[dict]:
-        from generator import (_random_dirname_rng, _random_filename_rng,
-                               _random_content)
-        import copy
-
-        num_ops = max(self.min_ops, min(
-            self.target_ops * 2,
-            int(self.rng.gauss(self.target_ops, self.target_ops * 0.3))))
-
-        results = []
-        rng = self.rng
-        enabled = self.commands
-
-        for _ in range(num_ops):
-            op = rng.choice(enabled)
-
-            cmd_str = ""
-            response_str = ""
-            is_error = False
-
-            if op == "ls":
-                entries = self.fs.list_dir(self.fs.cwd)
-                cmd_str = "ls"
-                response_str = "  ".join(entries) if entries else ""
-
-            elif op == "pwd":
-                cmd_str = "pwd"
-                response_str = self.fs.cwd
-
-            elif op == "mkdir":
-                name = _random_dirname_rng(rng)
-                for _ in range(10):
-                    if not self.fs.exists(self.fs.resolve(name)):
-                        break
-                    name = _random_dirname_rng(rng)
-                cmd_str = f"mkdir {name}"
-                err = self.fs.mkdir(name)
-                if err:
-                    continue  # skip failed ops
-
-            elif op == "touch":
-                name = _random_filename_rng(rng)
-                cmd_str = f"touch {name}"
-                err = self.fs.touch(name)
-                if err:
-                    continue
-
-            elif op == "echo_write":
-                name = _random_filename_rng(rng)
-                content = _random_content(rng)
-                cmd_str = f"echo {content} > {name}"
-                err = self.fs.write_file(name, content)
-                if err:
-                    continue
-
-            elif op == "echo_append":
-                files = self.fs.get_child_files()
-                if files and rng.random() < 0.7:
-                    name = rng.choice(files)
-                else:
-                    name = _random_filename_rng(rng)
-                content = _random_content(rng)
-                cmd_str = f"echo {content} >> {name}"
-                err = self.fs.append_file(name, content)
-                if err:
-                    continue
-
-            elif op == "cat":
-                files = self.fs.get_child_files()
-                if not files:
-                    continue
-                name = rng.choice(files)
-                content, err = self.fs.cat(name)
-                cmd_str = f"cat {name}"
-                if err:
-                    continue
-                response_str = content if content else ""
-
-            elif op == "cd_child":
-                dirs = self.fs.get_child_dirs()
-                if not dirs:
-                    continue
-                name = rng.choice(dirs)
-                cmd_str = f"cd {name}"
-                self.fs.cd(name)
-
-            elif op == "cd_up":
-                if self.fs.cwd == "/":
-                    continue
-                cmd_str = "cd .."
-                self.fs.cd("..")
-
-            elif op == "cd_abs":
-                dirs = self.fs.get_all_dirs()
-                if not dirs:
-                    continue
-                target = rng.choice(dirs)
-                cmd_str = f"cd {target}"
-                self.fs.cd(target)
-
-            elif op == "rm":
-                files = self.fs.get_child_files()
-                if not files:
-                    continue
-                name = rng.choice(files)
-                cmd_str = f"rm {name}"
-                self.fs.rm(name)
-
-            elif op == "cp":
-                files = self.fs.get_child_files()
-                if not files:
-                    continue
-                src = rng.choice(files)
-                dst = _random_filename_rng(rng)
-                cmd_str = f"cp {src} {dst}"
-                err = self.fs.cp(src, dst)
-                if err:
-                    continue
-
-            elif op == "mv":
-                files = self.fs.get_child_files()
-                if not files:
-                    continue
-                src = rng.choice(files)
-                dst = _random_filename_rng(rng)
-                cmd_str = f"mv {src} {dst}"
-                err = self.fs.mv(src, dst)
-                if err:
-                    continue
-
-            elif op == "head":
-                files = self.fs.get_child_files()
-                if not files:
-                    continue
-                name = rng.choice(files)
-                content, err = self.fs.head(name, n=1)
-                cmd_str = f"head {name}"
-                if err:
-                    continue
-                response_str = content if content else ""
-
-            elif op == "wc":
-                files = self.fs.get_child_files()
-                if not files:
-                    continue
-                name = rng.choice(files)
-                result, err = self.fs.wc(name)
-                cmd_str = f"wc {name}"
-                if err:
-                    continue
-                response_str = result
-
-            elif op == "find":
-                cmd_str = "find ."
-                response_str = self.fs.find(".")
-
-            elif op == "grep":
-                files = self.fs.get_child_files()
-                if not files:
-                    continue
-                name = rng.choice(files)
-                content = self.fs.files.get(self.fs.resolve(name), "")
-                if not content:
-                    continue
-                # Pick a word from the content to search for
-                words = content.split()
-                if not words:
-                    continue
-                pattern = rng.choice(words)
-                result, err = self.fs.grep(pattern, name)
-                cmd_str = f"grep {pattern} {name}"
-                if err:
-                    continue
-                response_str = result if result else ""
-
-            else:
-                continue
-
-            if not cmd_str:
-                continue
-
-            results.append({
-                "cmd_str": cmd_str,
-                "response_str": response_str,
-                "is_error": is_error,
-                "fs": copy.deepcopy(self.fs),
-            })
-
-        return results
-
-
 if __name__ == "__main__":
     import time
 
     tok = BashTokenizer()
+    print("Testing expanded dataset...")
 
-    print("Testing state-patch dataset...")
-    gen = StateTrackingGenerator(min_ops=5, target_ops=10, seed=42,
-                                 commands={"mkdir", "cd_child", "cd_up", "cd_abs", "ls"})
+    gen = StateTrackingGenerator(min_ops=50, target_ops=100, seed=42)
     cmds = gen.generate_with_state()
     samples = build_session_samples(cmds, tok)
 
     print(f"\nSession: {len(samples)} commands")
-    for i, s in enumerate(samples[:8]):
-        text = tok.decode(s["ids"])
-        trained = sum(1 for l in s["labels"] if l != -100)
-        print(f"\n  Cmd {i}: ({len(s['ids'])} tokens, {trained} trained)")
-        # Show truncated
-        if len(text) > 120:
-            print(f"    {text[:120]}...")
-        else:
-            print(f"    {text}")
 
-    print(f"\n\nTesting BashSessionDataset...")
-    ds = BashSessionDataset(buffer_size=4, workers=2, min_ops=5, target_ops=10,
-                            commands={"mkdir", "cd_child", "cd_up", "cd_abs", "ls"})
+    # Count command types
+    cmd_types = {}
+    for c in cmds:
+        cmd = c["cmd_str"].split()[0]
+        if "=" in cmd:
+            cmd = "var_set"
+        cmd_types[cmd] = cmd_types.get(cmd, 0) + 1
+
+    print(f"\nCommand distribution:")
+    for k, v in sorted(cmd_types.items(), key=lambda x: -x[1]):
+        print(f"  {k:>12s}: {v}")
+
+    # Show some samples
+    print(f"\nSample commands:")
+    for i, s in enumerate(samples):
+        text = tok.decode(s["ids"])
+        if i < 5 or "expr" in text or "sh " in text or "$" in text:
+            trained = sum(1 for l in s["labels"] if l != -100)
+            print(f"  [{i:>3d}] ({len(s['ids']):>3d} tok, {trained:>3d} trained) {text[:120]}")
+
+    # State size at end
+    last_fs = cmds[-1]["fs"]
+    state = last_fs.serialize_state()
+    state_tokens = len(tok.encode(state))
+    print(f"\nFinal state: {state_tokens} tokens, {len(last_fs.dirs)} dirs, "
+          f"{len(last_fs.files)} files, {len(last_fs.vars)} vars")
+
+    print(f"\nTesting BashSessionDataset...")
+    ds = BashSessionDataset(buffer_size=4, workers=2, min_ops=50, target_ops=100)
     t0 = time.time()
     for i, session in enumerate(ds):
         if i < 2:
-            print(f"\n  Session {i}: {len(session)} commands")
-            for j, s in enumerate(session[:3]):
-                text = tok.decode(s["ids"])
-                print(f"    Cmd {j}: {len(s['ids'])} tok | {text[:100]}")
+            print(f"  Session {i}: {len(session)} commands")
         if i >= 4:
             break
     ds.stop()
-    print(f"\n  5 sessions in {time.time()-t0:.2f}s")
+    print(f"  5 sessions in {time.time()-t0:.2f}s")

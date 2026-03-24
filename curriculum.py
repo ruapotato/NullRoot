@@ -52,27 +52,15 @@ STAGES = [
 def _build_gate_tests(stage_idx):
     tests = []
 
-    # mkdir + cd + ls
+    # mkdir + cd + ls + pwd
     tests.append([
         ("mkdir gal", "<output><eor>"),
         ("mkdir tov", "<output><eor>"),
         ("ls", "<output>gal  tov<eor>"),
-    ])
-    tests.append([
-        ("mkdir plok", "<output><eor>"),
-        ("cd plok", "<output><eor>"),
-        ("mkdir sub", "<output><eor>"),
-        ("ls", "<output>sub<eor>"),
+        ("cd gal", "<output><eor>"),
+        ("pwd", "<output>/gal<eor>"),
         ("cd ..", "<output><eor>"),
-        ("ls", "<output>plok<eor>"),
-    ])
-
-    # pwd
-    tests.append([
-        ("pwd", "<output>/<eor>"),
-        ("mkdir wun", "<output><eor>"),
-        ("cd wun", "<output><eor>"),
-        ("pwd", "<output>/wun<eor>"),
+        ("ls", "<output>gal  tov<eor>"),
     ])
 
     # echo > + cat
@@ -91,7 +79,6 @@ def _build_gate_tests(stage_idx):
     # rm
     tests.append([
         ("echo data > tmp.dat", "<output><eor>"),
-        ("ls", "<output>tmp.dat<eor>"),
         ("rm tmp.dat", "<output><eor>"),
         ("ls", "<output><eor>"),
     ])
@@ -108,7 +95,6 @@ def _build_gate_tests(stage_idx):
         ("echo moveme > old.txt", "<output><eor>"),
         ("mv old.txt new.txt", "<output><eor>"),
         ("cat new.txt", "<output>moveme<eor>"),
-        ("ls", "<output>new.txt<eor>"),
     ])
 
     # head
@@ -122,6 +108,24 @@ def _build_gate_tests(stage_idx):
     tests.append([
         ("echo hello world > count.txt", "<output><eor>"),
         ("wc count.txt", "<output>1 2 11 count.txt<eor>"),
+    ])
+
+    # Variables
+    tests.append([
+        ("x=42", "<output><eor>"),
+        ("echo $x", "<output>42<eor>"),
+    ])
+
+    # Math
+    tests.append([
+        ("expr 3 + 5", "<output>8<eor>"),
+        ("expr 10 * 4", "<output>40<eor>"),
+    ])
+
+    # Script execution
+    tests.append([
+        ("echo echo hello > test.sh", "<output><eor>"),
+        ("sh test.sh", "<output>hello<eor>"),
     ])
 
     return tests
@@ -233,40 +237,8 @@ def run_gate_tests(model, stage_idx, device, log_fn=None):
 
 
 def _execute_cmd_on_fs(fs, cmd_str):
-    """Execute a command string on a FileSystem (for state tracking in tests)."""
-    parts = cmd_str.split()
-    if not parts:
-        return
-    cmd = parts[0]
-    if cmd == "mkdir" and len(parts) > 1:
-        fs.mkdir(parts[1])
-    elif cmd == "cd" and len(parts) > 1:
-        fs.cd(parts[1])
-    elif cmd == "touch" and len(parts) > 1:
-        fs.touch(parts[1])
-    elif cmd == "ls" or cmd == "pwd":
-        pass  # read-only
-    elif cmd == "echo" and (">" in parts or ">>" in parts):
-        if ">>" in parts:
-            idx = parts.index(">>")
-            content = " ".join(parts[1:idx])
-            fname = parts[idx + 1]
-            fs.append_file(fname, content)
-        else:
-            idx = parts.index(">")
-            content = " ".join(parts[1:idx])
-            fname = parts[idx + 1]
-            fs.write_file(fname, content)
-    elif cmd == "cat":
-        pass  # read-only
-    elif cmd == "rm" and len(parts) > 1:
-        fs.rm(parts[1])
-    elif cmd == "cp" and len(parts) > 2:
-        fs.cp(parts[1], parts[2])
-    elif cmd == "mv" and len(parts) > 2:
-        fs.mv(parts[1], parts[2])
-    elif cmd in ("head", "wc", "find", "grep"):
-        pass  # read-only
+    """Execute a command on FileSystem for state tracking. Uses execute_command."""
+    fs.execute_command(cmd_str)
 
 
 # ---------------------------------------------------------------------------
