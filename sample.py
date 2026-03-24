@@ -35,9 +35,15 @@ def load_model(ckpt_path: str, device: torch.device) -> BashTransformer:
 
 @torch.no_grad()
 def generate(model, context_ids, tokenizer, device, max_new=512):
-    """Generate until <eor> or <nop>."""
+    """Generate response + state patch.
+
+    Output format: <output>...<eor><state>...<eor> or <output>...<eor><nop>
+    So we need to keep going past the first <eor> until we hit a second
+    <eor> or <nop> (which terminates the state patch).
+    """
     ids = list(context_ids)
     generated = []
+    eor_count = 0
     for _ in range(max_new):
         input_t = torch.tensor([ids], dtype=torch.long, device=device)
         with autocast("cuda", dtype=torch.bfloat16):
@@ -45,7 +51,13 @@ def generate(model, context_ids, tokenizer, device, max_new=512):
         next_id = out["logits"][0, -1, :].argmax().item()
         ids.append(next_id)
         generated.append(next_id)
-        if next_id in (tokenizer.eor_id, tokenizer.eos_id, tokenizer.nop_id):
+        if next_id == tokenizer.eor_id:
+            eor_count += 1
+            if eor_count >= 2:  # response <eor> + state <eor>
+                break
+        if next_id == tokenizer.nop_id:
+            break
+        if next_id == tokenizer.eos_id:
             break
     return generated
 

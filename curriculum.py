@@ -133,9 +133,10 @@ def _build_gate_tests(stage_idx):
 
 @torch.no_grad()
 def generate_response(model, context_ids, tokenizer, device, max_tokens=512):
-    """Generate until <eor> or <nop>."""
+    """Generate response + state patch (stop after 2nd <eor> or <nop>)."""
     ids = list(context_ids)
     generated = []
+    eor_count = 0
     for _ in range(max_tokens):
         input_t = torch.tensor([ids], dtype=torch.long, device=device)
         with autocast("cuda", dtype=torch.bfloat16):
@@ -143,7 +144,11 @@ def generate_response(model, context_ids, tokenizer, device, max_tokens=512):
         next_id = out["logits"][0, -1, :].argmax().item()
         ids.append(next_id)
         generated.append(next_id)
-        if next_id in (tokenizer.eor_id, tokenizer.eos_id, tokenizer.nop_id):
+        if next_id == tokenizer.eor_id:
+            eor_count += 1
+            if eor_count >= 2:
+                break
+        if next_id in (tokenizer.nop_id, tokenizer.eos_id):
             break
     return generated
 
