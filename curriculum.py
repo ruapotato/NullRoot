@@ -31,16 +31,19 @@ from generator import SessionGenerator, FileSystem
 # ---------------------------------------------------------------------------
 
 ALL_COMMANDS = [
+    # Filesystem
     "mkdir", "cd_child", "cd_up", "cd_abs", "ls", "pwd",
     "touch", "echo_write", "cat", "echo_append", "rm",
     "cp", "mv", "head", "wc", "find", "grep",
+    # Programming
+    "var_set", "var_echo", "expr_math", "export",
+    "write_script", "run_script",
 ]
 
 STAGES = [
     {
-        "name": "Stage 1: all commands",
+        "name": "Stage 1: filesystem + programming",
         "commands": ALL_COMMANDS,
-        "error_rate": 0.0,
     },
 ]
 
