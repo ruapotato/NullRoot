@@ -104,7 +104,7 @@ HTML = """<!DOCTYPE html>
 <body>
 
 <h1>NullRoot Training Dashboard</h1>
-<p class="subtitle">~35M param transformer with memory bank learning to simulate bash &nbsp; <span id="status">connecting...</span></p>
+<p class="subtitle">~20M param transformer learning programmable bash filesystem &nbsp; <span id="status">connecting...</span></p>
 
 <div class="stage-banner">
   <h2 id="stage-title">Waiting for data...</h2>
@@ -152,7 +152,7 @@ HTML = """<!DOCTYPE html>
 
 <script>
 const STAGE_DEFS = [
-  { name: 'S1', label: 'all commands', cmds: ['mkdir', 'cd', 'ls', 'pwd', 'touch', 'echo', 'cat', 'rm', 'cp', 'mv', 'head', 'wc', 'find', 'grep'] },
+  { name: 'S1', label: 'all commands', cmds: ['mkdir', 'cd', 'ls', 'pwd', 'touch', 'echo', 'cat', 'rm', 'cp', 'mv', 'head', 'wc', 'find', 'grep', 'expr', 'sh', '$var', 'export'] },
 ];
 const STAGE_NAMES = STAGE_DEFS.map(s => s.label);
 const STAGE_COLORS = [

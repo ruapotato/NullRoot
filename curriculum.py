@@ -331,9 +331,7 @@ def train_curriculum(cfg: CurriculumConfig):
             workers=cfg.data_workers,
             min_ops=cfg.min_ops,
             target_ops=cfg.target_ops,
-            error_rate=stage["error_rate"],
             base_seed=cfg.seed + stage_idx * 1000,
-            commands=stage["commands"],
         )
         train_iter = iter(train_ds)
 
