@@ -32,12 +32,11 @@ from generator import SessionGenerator, FileSystem
 
 ALL_COMMANDS = [
     # Filesystem
-    "mkdir", "cd_child", "cd_up", "cd_abs", "ls", "pwd",
-    "touch", "echo_write", "cat", "echo_append", "rm",
-    "cp", "mv", "head", "wc", "find", "grep",
+    "mkdir", "cd", "ls", "pwd",
+    "touch", "echo_write", "echo_script", "echo_append",
+    "cat", "rm", "cp", "mv", "head", "wc", "find", "grep",
     # Programming
-    "var_set", "var_echo", "expr_math", "export",
-    "write_script", "run_script",
+    "var_set", "var_echo", "expr_math", "export", "sh",
 ]
 
 STAGES = [

@@ -91,17 +91,16 @@ class StateTrackingGenerator:
 
     # Weighted command pool — controls distribution
     COMMAND_WEIGHTS = {
-        # Filesystem (heavily weighted — core skill)
-        "mkdir": 12, "cd_child": 10, "cd_up": 6, "cd_abs": 5,
-        "ls": 15, "pwd": 5,
-        "touch": 8, "echo_write": 12, "echo_append": 6,
+        # Filesystem
+        "mkdir": 12, "cd": 18, "ls": 15, "pwd": 5,
+        "touch": 8, "echo_write": 10, "echo_script": 4, "echo_append": 6,
         "cat": 12, "rm": 4, "cp": 4, "mv": 4,
         "head": 3, "wc": 3, "find": 3, "grep": 3,
         # Variables + math
         "var_set": 8, "var_echo": 6, "expr_math": 6,
         "export": 3,
-        # Scripts
-        "write_script": 5, "run_script": 4,
+        # Script execution
+        "sh": 4,
     }
 
     def __init__(self, min_ops=50, target_ops=150, seed=None, commands=None):
@@ -189,37 +188,69 @@ class StateTrackingGenerator:
                 return None
 
         elif op == "cat":
+            # Sometimes use relative name, sometimes absolute path
             files = fs.get_child_files()
             if not files:
-                return None
-            name = rng.choice(files)
-            content, err = fs.cat(name)
-            cmd_str = f"cat {name}"
-            if err:
-                return None
-            response_str = content if content else ""
+                # Try an absolute path to any file
+                all_files = sorted(fs.files.keys())
+                if not all_files:
+                    return None
+                abspath = rng.choice(all_files)
+                content = fs.files[abspath]
+                cmd_str = f"cat {abspath}"
+                response_str = content if content else ""
+            else:
+                name = rng.choice(files)
+                # 30% chance to use absolute path
+                if rng.random() < 0.3:
+                    abspath = fs.resolve(name)
+                    cmd_str = f"cat {abspath}"
+                else:
+                    cmd_str = f"cat {name}"
+                content, err = fs.cat(name)
+                if err:
+                    return None
+                response_str = content if content else ""
 
-        elif op == "cd_child":
-            dirs = fs.get_child_dirs()
-            if not dirs:
-                return None
-            name = rng.choice(dirs)
-            cmd_str = f"cd {name}"
-            fs.cd(name)
-
-        elif op == "cd_up":
-            if fs.cwd == "/":
-                return None
-            cmd_str = "cd .."
-            fs.cd("..")
-
-        elif op == "cd_abs":
-            dirs = fs.get_all_dirs()
-            if not dirs:
-                return None
-            target = rng.choice(dirs)
-            cmd_str = f"cd {target}"
-            fs.cd(target)
+        elif op == "cd":
+            # Pick a cd style: child dir, .., absolute, or relative path
+            style = rng.choices(
+                ["child", "up", "abs", "relative"],
+                weights=[10, 6, 5, 4], k=1)[0]
+            if style == "child":
+                dirs = fs.get_child_dirs()
+                if not dirs:
+                    return None
+                name = rng.choice(dirs)
+                cmd_str = f"cd {name}"
+                fs.cd(name)
+            elif style == "up":
+                if fs.cwd == "/":
+                    return None
+                cmd_str = "cd .."
+                fs.cd("..")
+            elif style == "abs":
+                dirs = fs.get_all_dirs()
+                if not dirs:
+                    return None
+                target = rng.choice(dirs)
+                cmd_str = f"cd {target}"
+                fs.cd(target)
+            elif style == "relative":
+                # cd into nested path like cd foo/bar
+                dirs = fs.get_child_dirs()
+                if not dirs:
+                    return None
+                name = rng.choice(dirs)
+                # Sometimes go deeper
+                fs.cd(name)
+                child_dirs = fs.get_child_dirs()
+                if child_dirs and rng.random() < 0.4:
+                    sub = rng.choice(child_dirs)
+                    cmd_str = f"cd {name}/{sub}"
+                    fs.cd(sub)
+                else:
+                    cmd_str = f"cd {name}"
 
         elif op == "rm":
             files = fs.get_child_files()
@@ -328,8 +359,8 @@ class StateTrackingGenerator:
             fs.set_var(name, value)
 
         # --- Script ops ---
-        elif op == "write_script":
-            # Write a small script: 2-4 commands
+        elif op == "echo_script":
+            # echo "cmd1\ncmd2" > name.sh — creates a script file
             name = _gen_syllable_name_rng(rng, 1) + ".sh"
             script_lines = []
             for _ in range(rng.randint(2, 4)):
@@ -338,12 +369,14 @@ class StateTrackingGenerator:
                     script_lines.append(line)
             if not script_lines:
                 return None
-            content = "\\n".join(script_lines)
-            cmd_str = f'echo "{content}" > {name}'
+            # Command uses \n to represent newlines (as user would type)
+            display_content = "\\n".join(script_lines)
+            cmd_str = f'echo "{display_content}" > {name}'
             # Store with actual newlines
             fs.write_file(name, "\n".join(script_lines))
 
-        elif op == "run_script":
+        elif op == "sh":
+            # sh name.sh — execute a script file
             files = fs.get_child_files()
             scripts = [f for f in files if f.endswith(".sh")]
             if not scripts:
