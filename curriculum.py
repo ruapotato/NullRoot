@@ -32,42 +32,37 @@ from generator import SessionGenerator, FileSystem
 
 STAGES = [
     {
-        "name": "Stage 1: mkdir + cd + ls",
-        "commands": {"mkdir", "cd_child", "cd_up", "cd_abs", "ls"},
-        "error_rate": 0.0,
+        "name": "Stage 1: mkdir + cd + ls + errors",
+        "commands": {"mkdir", "cd_child", "cd_up", "cd_abs", "ls", "errors"},
+        "error_rate": 0.05,
     },
     {
         "name": "Stage 2: + pwd",
-        "commands": {"mkdir", "cd_child", "cd_up", "cd_abs", "ls", "pwd"},
-        "error_rate": 0.0,
+        "commands": {"mkdir", "cd_child", "cd_up", "cd_abs", "ls", "pwd", "errors"},
+        "error_rate": 0.05,
     },
     {
         "name": "Stage 3: + touch",
-        "commands": {"mkdir", "cd_child", "cd_up", "cd_abs", "ls", "pwd", "touch"},
-        "error_rate": 0.0,
+        "commands": {"mkdir", "cd_child", "cd_up", "cd_abs", "ls", "pwd", "touch", "errors"},
+        "error_rate": 0.05,
     },
     {
         "name": "Stage 4: + echo >",
-        "commands": {"mkdir", "cd_child", "cd_up", "cd_abs", "ls", "pwd", "touch", "echo_write"},
-        "error_rate": 0.0,
+        "commands": {"mkdir", "cd_child", "cd_up", "cd_abs", "ls", "pwd", "touch", "echo_write", "errors"},
+        "error_rate": 0.05,
     },
     {
         "name": "Stage 5: + cat",
-        "commands": {"mkdir", "cd_child", "cd_up", "cd_abs", "ls", "pwd", "touch", "echo_write", "cat"},
-        "error_rate": 0.0,
+        "commands": {"mkdir", "cd_child", "cd_up", "cd_abs", "ls", "pwd", "touch", "echo_write", "cat", "errors"},
+        "error_rate": 0.05,
     },
     {
         "name": "Stage 6: + echo >>",
-        "commands": {"mkdir", "cd_child", "cd_up", "cd_abs", "ls", "pwd", "touch", "echo_write", "cat", "echo_append"},
-        "error_rate": 0.0,
+        "commands": {"mkdir", "cd_child", "cd_up", "cd_abs", "ls", "pwd", "touch", "echo_write", "cat", "echo_append", "errors"},
+        "error_rate": 0.05,
     },
     {
         "name": "Stage 7: + rm",
-        "commands": {"mkdir", "cd_child", "cd_up", "cd_abs", "ls", "pwd", "touch", "echo_write", "cat", "echo_append", "rm"},
-        "error_rate": 0.0,
-    },
-    {
-        "name": "Stage 8: + errors",
         "commands": {"mkdir", "cd_child", "cd_up", "cd_abs", "ls", "pwd", "touch", "echo_write", "cat", "echo_append", "rm", "errors"},
         "error_rate": 0.05,
     },
@@ -100,6 +95,12 @@ def _build_gate_tests(stage_idx):
             ("mkdir sub", "<output><eor>"),
             ("mkdir rak", "<output><eor>"),
             ("ls", "<output>rak  sub<eor>"),
+        ])
+        # Error cases
+        tests.append([
+            ("cd nofolder", "<err><eor>"),
+            ("mkdir dup", "<output><eor>"),
+            ("mkdir dup", "<err><eor>"),
         ])
 
     if stage_idx >= 1:
@@ -146,13 +147,7 @@ def _build_gate_tests(stage_idx):
             ("ls", "<output><eor>"),
         ])
 
-    if stage_idx >= 7:
-        tests.append([
-            ("cd nofolder", "<err><eor>"),
-            ("cat nofile.txt", "<err><eor>"),
-            ("mkdir dup", "<output><eor>"),
-            ("mkdir dup", "<err><eor>"),
-        ])
+    # Error cases covered in stage 0 gate tests above
 
     return tests
 
