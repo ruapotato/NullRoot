@@ -106,7 +106,7 @@ All training data is generated on the fly — no datasets, no disk I/O. The simu
 
 ```bash
 # Phase 3: full programmable system (current)
-python curriculum.py --min-ops 50 --target-ops 150
+python curriculum.py --min-ops 40 --target-ops 77
 
 # Monitor training
 python dashboard.py   # http://localhost:5000
@@ -116,8 +116,8 @@ python dashboard.py   # http://localhost:5000
 
 | Parameter | Value | Description |
 |-----------|-------|-------------|
-| `--min-ops` | 50 | Minimum commands per training session |
-| `--target-ops` | 150 | Target commands per session (gaussian around this) |
+| `--min-ops` | 40 | Minimum commands per training session |
+| `--target-ops` | 77 | Target commands per session (gaussian around this) |
 | `--gate-check-every` | 500 | Steps between gate test evaluations |
 | Learning rate | 3e-4 → 3e-5 | Cosine decay with 100-step warmup |
 | Optimizer | AdamW | betas=(0.9, 0.95), weight_decay=0.1 |
@@ -135,10 +135,10 @@ pip install torch  # tested with PyTorch 2.x, CUDA
 python verify_state.py
 
 # Start training from scratch
-python curriculum.py --min-ops 50 --target-ops 150
+python curriculum.py --min-ops 40 --target-ops 77
 
 # Resume from checkpoint after crash
-python curriculum.py --min-ops 50 --target-ops 150 \
+python curriculum.py --min-ops 40 --target-ops 77 \
     --resume-ckpt checkpoints/latest.pt --resume-stage 0
 ```
 
@@ -171,6 +171,13 @@ Training runs until **all** gate tests pass (13 meaningful tests covering every 
 
 ## Status
 
-**Phase 3 in progress.** Expanding from 14 filesystem commands to a programmable system with variables, math, and script execution. Training on deep sessions (50-150 ops) with the full command set.
+**Phase 3 training in progress.** 21 command types (filesystem + variables + math + scripts) trained simultaneously. At step 8.7K: loss 0.02, 9/13 gate tests passing. Working at checkpoint:
+
+- mkdir, cd, ls, pwd, touch, echo >, echo >>, cat, rm, cp, mv — all correct
+- Variable assignment (`x=42`) and expansion (`echo $x` → `42`) — working
+- Deep navigation (cd into subdirs, ls, cat with absolute paths) — working
+- Math (`expr 5 + 3`) — learning but not accurate yet
+- wc — close but counts off
+- Script execution (`sh file.sh`) — not tested yet at checkpoint
 
 **Phase 2 complete.** State-patch architecture proven — model learned all 14 filesystem commands in a single stage (13/13 gate tests, step 37K). Verified correct across 8586 commands with zero state errors.
