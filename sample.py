@@ -1,9 +1,12 @@
 """
-Interactive inference for BashTransformer (Phase 2 — memory-based).
+Interactive inference for NullRoot.
 
-Each command is processed in isolation. Memory carries filesystem state
-across commands within the session. No token history — only the current
-command tokens and memory are fed to the model.
+The model reads filesystem state + command, produces a response + state patch.
+State patches are applied to maintain the filesystem between commands.
+
+Usage:
+    python sample.py checkpoints/nullroot_v2.pt
+    python sample.py checkpoints/nullroot_v2.pt --demo unix
 """
 
 import argparse
@@ -14,10 +17,10 @@ from torch.amp import autocast
 
 from tokenizer import BashTokenizer
 from model import BashTransformer, BashTransformerConfig
+from generator import FileSystem
 
 
 def load_model(ckpt_path: str, device: torch.device) -> BashTransformer:
-    """Load a trained model from checkpoint."""
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     config = ckpt.get("config", BashTransformerConfig())
     model = BashTransformer(config).to(device).to(torch.bfloat16)
@@ -25,120 +28,236 @@ def load_model(ckpt_path: str, device: torch.device) -> BashTransformer:
     state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
     model.load_state_dict(state_dict)
     model.eval()
-    step = ckpt.get("global_step", ckpt.get("step", "?"))
+    step = ckpt.get("global_step", "?")
     print(f"Loaded checkpoint from step {step}")
     return model
 
 
 @torch.no_grad()
-def generate(
-    model: BashTransformer,
-    cmd_ids: list[int],
-    memory: torch.Tensor,
-    tokenizer: BashTokenizer,
-    max_new_tokens: int = 4096,
-    temperature: float = 0.0,
-    device: torch.device = torch.device("cpu"),
-) -> tuple[list[int], torch.Tensor]:
-    """Generate tokens for a single command using memory.
-
-    Returns (generated_ids, updated_memory).
-    """
-    eor_id = tokenizer.eor_id
-    eos_id = tokenizer.eos_id
-
-    ids = list(cmd_ids)
+def generate(model, context_ids, tokenizer, device, max_new=512):
+    """Generate until <eor> or <nop>."""
+    ids = list(context_ids)
     generated = []
-
-    for _ in range(max_new_tokens):
-        input_ids = torch.tensor([ids], dtype=torch.long, device=device)
-
+    for _ in range(max_new):
+        input_t = torch.tensor([ids], dtype=torch.long, device=device)
         with autocast("cuda", dtype=torch.bfloat16):
-            out = model(input_ids, memory=memory)
-        logits = out["logits"][0, -1, :]
-        memory = out["memory"]
-
-        if temperature <= 0:
-            next_id = logits.argmax().item()
-        else:
-            probs = torch.softmax(logits / temperature, dim=-1)
-            next_id = torch.multinomial(probs, 1).item()
-
+            out = model(input_t)
+        next_id = out["logits"][0, -1, :].argmax().item()
         ids.append(next_id)
         generated.append(next_id)
-
-        if next_id == eor_id or next_id == eos_id:
+        if next_id in (tokenizer.eor_id, tokenizer.eos_id, tokenizer.nop_id):
             break
+    return generated
 
-    return generated, memory
+
+def run_command(model, state_str, cmd_str, tok, device, fs):
+    """Run one command: build input, generate, parse output, apply patch."""
+    # Build input
+    input_text = ""
+    if state_str:
+        input_text += f"<state>{state_str}<eor>"
+    input_text += f"<prompt>{cmd_str}<eoi>"
+    context_ids = tok.encode(input_text)
+
+    # Generate full output (response + state patch)
+    gen_ids = generate(model, context_ids, tok, device)
+    gen_text = tok.decode(gen_ids)
+
+    # Parse response vs state patch
+    response_text = gen_text
+    patch_text = ""
+
+    if "<state>" in gen_text:
+        idx = gen_text.index("<state>")
+        response_text = gen_text[:idx]
+        rest = gen_text[idx + 7:]  # skip <state>
+        if rest.endswith("<eor>"):
+            rest = rest[:-5]
+        patch_text = rest
+    elif "<nop>" in gen_text:
+        response_text = gen_text[:gen_text.index("<nop>")]
+
+    # Apply patch to filesystem state
+    if patch_text:
+        state_str = FileSystem.apply_patch(state_str, patch_text)
+
+    # Also execute on real fs for state tracking (fallback)
+    _execute_on_fs(fs, cmd_str)
+
+    # Clean response for display
+    display = response_text
+    for tag in ["<output>", "<err>", "<eor>", "<prompt>", "<eos>", "<eoi>"]:
+        display = display.replace(tag, "")
+
+    return display, state_str
+
+
+def _execute_on_fs(fs, cmd_str):
+    """Execute command on filesystem for state tracking."""
+    parts = cmd_str.split()
+    if not parts:
+        return
+    cmd = parts[0]
+    if cmd == "mkdir" and len(parts) > 1:
+        fs.mkdir(parts[1])
+    elif cmd == "cd" and len(parts) > 1:
+        fs.cd(parts[1])
+    elif cmd == "touch" and len(parts) > 1:
+        fs.touch(parts[1])
+    elif cmd == "echo" and (">" in parts or ">>" in parts):
+        if ">>" in parts:
+            idx = parts.index(">>")
+            content = " ".join(parts[1:idx])
+            fs.append_file(parts[idx + 1], content)
+        else:
+            idx = parts.index(">")
+            content = " ".join(parts[1:idx])
+            fs.write_file(parts[idx + 1], content)
+    elif cmd == "rm" and len(parts) > 1:
+        fs.rm(parts[1])
+    elif cmd == "cp" and len(parts) > 2:
+        fs.cp(parts[1], parts[2])
+    elif cmd == "mv" and len(parts) > 2:
+        fs.mv(parts[1], parts[2])
+
+
+# ---------------------------------------------------------------------------
+# Demo: pre-built filesystem
+# ---------------------------------------------------------------------------
+
+DEMOS = {
+    "unix": [
+        "mkdir etc",
+        "mkdir home",
+        "mkdir usr",
+        "mkdir var",
+        "mkdir tmp",
+        "cd etc",
+        "echo nameserver 8.8.8.8 > resolv.conf",
+        "echo root 0 0 > passwd",
+        "echo 127.0.0.1 localhost > hosts",
+        "mkdir ssh",
+        "cd ssh",
+        "echo port 22 > sshd_config",
+        "cd /home",
+        "mkdir alice",
+        "mkdir bob",
+        "cd alice",
+        "mkdir documents",
+        "mkdir projects",
+        "echo hello world > readme.txt",
+        "cd documents",
+        "echo meeting notes > notes.txt",
+        "echo todo fix bugs > todo.txt",
+        "cd /home/bob",
+        "mkdir scripts",
+        "cd scripts",
+        "echo echo backup started > backup.sh",
+        "cd /usr",
+        "mkdir bin",
+        "mkdir lib",
+        "cd bin",
+        "touch ls",
+        "touch cat",
+        "touch grep",
+        "cd /var",
+        "mkdir log",
+        "cd log",
+        "echo system started > syslog",
+        "echo login alice >> syslog",
+        "cd /",
+    ],
+    "project": [
+        "mkdir src",
+        "mkdir tests",
+        "mkdir docs",
+        "mkdir config",
+        "echo print hello > src/main.py",
+        "echo import main > src/init.py",
+        "echo assert true > tests/test.py",
+        "echo name myapp version 1 > config/app.cfg",
+        "echo build dist .env > .gitignore",
+        "echo my project readme > readme.md",
+        "touch changelog.md",
+    ],
+}
+
+
+def run_demo(model, demo_name, tok, device):
+    """Build a filesystem with pre-set commands, then drop into interactive mode."""
+    if demo_name not in DEMOS:
+        print(f"Unknown demo: {demo_name}")
+        print(f"Available: {', '.join(DEMOS.keys())}")
+        return
+
+    commands = DEMOS[demo_name]
+    state_str = ""
+    fs = FileSystem()
+
+    print(f"\nBuilding '{demo_name}' filesystem ({len(commands)} commands)...")
+    for cmd in commands:
+        output, state_str = run_command(model, state_str, cmd, tok, device, fs)
+        if output.strip():
+            print(f"  $ {cmd}")
+            print(f"  {output}")
+
+    # Use the real fs state (more reliable than model patches for setup)
+    state_str = fs.serialize_state()
+
+    print(f"\nFilesystem ready. {len(fs.dirs)} dirs, {len(fs.files)} files.")
+    print(f"CWD: {fs.cwd}")
+    print(f"State: {len(state_str)} chars\n")
+
+    return state_str, fs
 
 
 def interactive(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    tokenizer = BashTokenizer()
+    tok = BashTokenizer()
     model = load_model(args.checkpoint, device)
 
-    # Fresh memory for the session
-    memory = model.reset_memory(1, device, next(model.parameters()).dtype)
+    state_str = ""
+    fs = FileSystem()
 
-    print(f"\nBashTransformer interactive mode (Phase 2 — memory-based)")
-    print(f"Memory: DeltaNet state {model.config.state_heads}h x {model.config.state_head_dim}d")
-    print(f"Type bash commands. 'reset' to clear memory. Ctrl-C or 'exit' to quit.\n")
+    if args.demo:
+        state_str, fs = run_demo(model, args.demo, tok, device)
+
+    print(f"NullRoot interactive shell (state-patch architecture)")
+    print(f"Commands: mkdir cd ls pwd touch echo cat rm cp mv head wc find grep")
+    print(f"Type 'state' to see raw state. 'reset' to clear. Ctrl-C to quit.\n")
 
     while True:
         try:
-            cmd = input("$ ")
+            cwd = fs.cwd
+            cmd = input(f"nullroot:{cwd}$ ")
         except (EOFError, KeyboardInterrupt):
             print()
             break
 
-        if cmd.strip() == "exit":
+        cmd = cmd.strip()
+        if not cmd:
+            continue
+        if cmd == "exit":
             break
-
-        if cmd.strip() == "reset":
-            memory = model.reset_memory(1, device, next(model.parameters()).dtype)
-            print("(memory reset)")
+        if cmd == "reset":
+            state_str = ""
+            fs = FileSystem()
+            print("(reset)")
+            continue
+        if cmd == "state":
+            print(f"  {state_str}")
             continue
 
-        # Encode: <prompt>command<eoi>
-        cmd_text = f"<prompt>{cmd}<eoi>"
-        cmd_ids = tokenizer.encode(cmd_text)
-
-        # Generate response using only this command + memory
-        generated, memory = generate(
-            model, cmd_ids, memory, tokenizer,
-            max_new_tokens=args.max_tokens,
-            temperature=args.temperature,
-            device=device,
-        )
-
-        # After generation, update memory with the full exchange
-        # (command + generated response) so future commands see it
-        full_ids = cmd_ids + generated
-        input_t = torch.tensor([full_ids], dtype=torch.long, device=device)
-        with torch.no_grad():
-            with autocast("cuda", dtype=torch.bfloat16):
-                out = model(input_t, memory=memory)
-        memory = out["memory"]
-
-        # Decode and display
-        response_text = tokenizer.decode(generated)
-        display = response_text
-        for tag in ["<output>", "<err>", "<eor>", "<prompt>", "<eos>", "<eoi>"]:
-            display = display.replace(tag, "")
-        display = display.strip()
-
-        if display:
-            print(display)
+        output, state_str = run_command(model, state_str, cmd, tok, device, fs)
+        if output.strip():
+            print(output)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Interactive BashTransformer inference (Phase 2)")
+    parser = argparse.ArgumentParser(description="NullRoot interactive shell")
     parser.add_argument("checkpoint", help="Path to model checkpoint")
-    parser.add_argument("--max-tokens", type=int, default=4096,
-                        help="Max tokens to generate per response")
-    parser.add_argument("--temperature", "-t", type=float, default=0.0,
-                        help="Sampling temperature (0 = greedy)")
+    parser.add_argument("--demo", "-d", type=str, default=None,
+                        choices=list(DEMOS.keys()),
+                        help="Pre-build a filesystem before interactive mode")
     args = parser.parse_args()
     interactive(args)

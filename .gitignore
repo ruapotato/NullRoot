@@ -1,5 +1,7 @@
-checkpoints/
+checkpoints/archive*/
+checkpoints/latest.pt
+checkpoints/stage*_passed.pt
+checkpoints/stage*_timeout.pt
 data/
 __pycache__/
 *.pyc
-*.pt
