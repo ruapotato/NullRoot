@@ -57,7 +57,7 @@ def generate(model, context_ids, tok, device, max_new=500):
 
 
 def run_command(model, fs, cmd, tok, device):
-    """Run command: model generates response, Python updates state."""
+    """Run command: model generates response AND state patch. Both are used."""
     # Build input from current page
     full_input = fs.serialize_full_input(cmd)
     ids = tok.encode(full_input)
@@ -65,7 +65,7 @@ def run_command(model, fs, cmd, tok, device):
     # Model generates
     raw = generate(model, ids, tok, device)
 
-    # Parse response
+    # Parse response + patch
     response = raw
     model_patch = ""
     if "<state>" in raw:
@@ -78,10 +78,21 @@ def run_command(model, fs, cmd, tok, device):
 
     display = response.replace("<output>", "").replace("<err>", "").replace("<eor>", "").strip()
 
-    # Execute on real filesystem (ground truth state updates)
-    gt_response, gt_patch = fs.execute(cmd)
-    if gt_patch:
-        fs.apply_patch(gt_patch)
+    # Apply model's patch to the page table
+    if model_patch:
+        # cd produces a full page swap — update cwd + load new page
+        if cmd.strip().startswith("cd "):
+            target = cmd.strip().split()[1]
+            if target == "..":
+                if fs.cwd != "/":
+                    fs.cwd = "/".join(fs.cwd.rstrip("/").split("/")[:-1]) or "/"
+            elif target.startswith("/"):
+                fs.cwd = target
+            else:
+                child_path = fs._child_path(target)
+                fs.cwd = child_path
+            fs._ensure_page(fs.cwd)
+        fs.apply_patch(model_patch)
 
     return display
 
