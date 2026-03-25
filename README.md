@@ -12,8 +12,8 @@ pip install torch                          # PyTorch with CUDA
 # Try the reference simulator (no GPU needed, perfect execution)
 python nullroot_sim.py --demo unix
 
-# Try the neural network (requires CUDA GPU)
-python sample.py checkpoints/nullroot_v3.pt --demo unix
+# Try the neural network (requires CUDA GPU, checkpoint auto-detected)
+python sample.py --demo unix
 
 # Verify the data pipeline
 python verify_state.py
@@ -49,11 +49,12 @@ python nullroot_sim.py --demo project     # project directory
 python nullroot_sim.py --demo scripting   # variables, math, scripts
 ```
 
-### Neural network version (requires trained checkpoint + CUDA GPU)
+### Neural network version (requires CUDA GPU)
 
 ```bash
-python sample.py checkpoints/nullroot_v3.pt
-python sample.py checkpoints/nullroot_v3.pt --demo unix
+python sample.py                  # interactive shell
+python sample.py --demo unix      # pre-built filesystem
+python sample.py --demo project   # project directory
 ```
 
 ## Supported commands

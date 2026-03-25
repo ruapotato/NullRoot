@@ -5,8 +5,8 @@ The model reads filesystem state + command, produces a response + state patch.
 State patches are applied to maintain the filesystem between commands.
 
 Usage:
-    python sample.py checkpoints/nullroot_v2.pt
-    python sample.py checkpoints/nullroot_v2.pt --demo unix
+    python sample.py checkpoints/nullroot_v3.pt
+    python sample.py checkpoints/nullroot_v3.pt --demo unix
 """
 
 import argparse
@@ -237,7 +237,8 @@ def interactive(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="NullRoot interactive shell")
-    parser.add_argument("checkpoint", help="Path to model checkpoint")
+    parser.add_argument("checkpoint", nargs="?", default="checkpoints/nullroot_v3.pt",
+                        help="Path to model checkpoint (default: checkpoints/nullroot_v3.pt)")
     parser.add_argument("--demo", "-d", type=str, default=None,
                         choices=list(DEMOS.keys()),
                         help="Pre-build a filesystem before interactive mode")
