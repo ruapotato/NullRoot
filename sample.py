@@ -78,20 +78,26 @@ def run_command(model, fs, cmd, tok, device):
 
     display = response.replace("<output>", "").replace("<err>", "").replace("<eor>", "").strip()
 
-    # Apply model's patch to the page table
-    if model_patch:
-        # cd produces a full page swap — update cwd + load new page
-        if cmd.strip().startswith("cd "):
-            target = cmd.strip().split()[1]
-            if target == "..":
-                if fs.cwd != "/":
-                    fs.cwd = "/".join(fs.cwd.rstrip("/").split("/")[:-1]) or "/"
-            elif target.startswith("/"):
-                fs.cwd = target
-            else:
-                child_path = fs._child_path(target)
-                fs.cwd = child_path
-            fs._ensure_page(fs.cwd)
+    # Handle state updates
+    parts = cmd.strip().split()
+    if parts[0] == "cd" and len(parts) > 1:
+        # cd is a page swap — Python manages the page table
+        # The model's patch describes the NEW page's state
+        target = parts[1]
+        if target == "..":
+            if fs.cwd != "/":
+                fs.cwd = "/".join(fs.cwd.rstrip("/").split("/")[:-1]) or "/"
+        elif target.startswith("/"):
+            fs.cwd = target
+        else:
+            fs.cwd = fs._child_path(target)
+        fs._ensure_page(fs.cwd)
+        # Only apply patch if the page is empty (new directory)
+        # Otherwise keep the cached page (we've been here before)
+        if model_patch and not fs._current_page()["children"] and not fs._current_page()["files"]:
+            fs.apply_patch(model_patch)
+    elif model_patch:
+        # Non-cd commands: apply model's patch to current page
         fs.apply_patch(model_patch)
 
     return display
