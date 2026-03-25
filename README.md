@@ -171,13 +171,34 @@ Training runs until **all** gate tests pass (13 meaningful tests covering every 
 
 ## Status
 
-**Phase 3 training in progress.** 21 command types (filesystem + variables + math + scripts) trained simultaneously. At step 8.7K: loss 0.02, 9/13 gate tests passing. Working at checkpoint:
+**Phase 3: 47/53 tests passing (89%).** 21 command types trained simultaneously at step 14K. Results:
 
-- mkdir, cd, ls, pwd, touch, echo >, echo >>, cat, rm, cp, mv — all correct
-- Variable assignment (`x=42`) and expansion (`echo $x` → `42`) — working
-- Deep navigation (cd into subdirs, ls, cat with absolute paths) — working
-- Math (`expr 5 + 3`) — learning but not accurate yet
-- wc — close but counts off
-- Script execution (`sh file.sh`) — not tested yet at checkpoint
+| Category | Status | Details |
+|----------|--------|---------|
+| Filesystem | **Perfect** | mkdir, cd, ls, pwd, touch, rm, cp, mv — all correct |
+| Files | **Perfect** | echo >, echo >>, cat, head — including multiline content |
+| Variables | **Perfect** | `x=42` then `echo $x` → `42` |
+| Scripts | **Working** | `echo echo hello > test.sh` then `sh test.sh` → `hello` |
+| Absolute paths | **Working** | `cat /path/to/file`, `cd /deep/path` |
+| Deep navigation | **Mostly** | 3+ levels deep occasionally garbles paths |
+| Math | **Learning** | Outputs numbers but wrong — pattern error, needs more training |
+| find | **Partial** | Complex recursive output still garbled |
 
-**Phase 2 complete.** State-patch architecture proven — model learned all 14 filesystem commands in a single stage (13/13 gate tests, step 37K). Verified correct across 8586 commands with zero state errors.
+**Phase 2 complete.** State-patch architecture proven on filesystem-only task (13/13, step 37K).
+
+## The state-patch pattern
+
+The core idea behind NullRoot generalizes beyond bash:
+
+```
+State:  [structured representation of current world]
+Input:  [action or event]
+Output: [response] + [minimal state diff]
+```
+
+The model learns to **read structured state, process actions, and produce minimal updates**. The state format and domain can be anything — filesystem, game world, database, API session. The key properties:
+
+- **State scales with complexity, not history** — mkdir+rm 100 times = small state
+- **Patches are minimal** — only changed entries, not full rewrites
+- **Fully in token space** — no special memory modules, just a transformer reading and writing tokens
+- **Verified deterministic** — reference simulator proves correctness before training
