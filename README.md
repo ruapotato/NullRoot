@@ -2,6 +2,26 @@
 
 A ~20M parameter transformer that learns to simulate a programmable bash filesystem from scratch. No real data — every training session is synthetically generated. The model tracks filesystem state (directories, files, contents, variables, cwd) across commands by reading and writing a compact state representation as tokens.
 
+## Quick start
+
+```bash
+git clone https://github.com/ruapotato/NullRoot
+cd NullRoot
+pip install torch                          # PyTorch with CUDA
+
+# Try the reference simulator (no GPU needed, perfect execution)
+python nullroot_sim.py --demo unix
+
+# Try the neural network (requires CUDA GPU)
+python sample.py checkpoints/nullroot_v3.pt --demo unix
+
+# Verify the data pipeline
+python verify_state.py
+
+# Train from scratch
+python curriculum.py --min-ops 40 --target-ops 77
+```
+
 ## How it works
 
 Each command cycle:
@@ -29,11 +49,11 @@ python nullroot_sim.py --demo project     # project directory
 python nullroot_sim.py --demo scripting   # variables, math, scripts
 ```
 
-### Neural network version (requires trained checkpoint)
+### Neural network version (requires trained checkpoint + CUDA GPU)
 
 ```bash
-python sample.py checkpoints/nullroot_v2.pt
-python sample.py checkpoints/nullroot_v2.pt --demo unix
+python sample.py checkpoints/nullroot_v3.pt
+python sample.py checkpoints/nullroot_v3.pt --demo unix
 ```
 
 ## Supported commands
