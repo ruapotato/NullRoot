@@ -1,6 +1,6 @@
 # NullRoot
 
-A ~20M parameter transformer that learns to simulate a programmable bash filesystem from scratch. No real data — every training session is synthetically generated. The model tracks filesystem state (directories, files, contents, variables, cwd) across commands by reading and writing a compact state representation as tokens.
+A ~20M parameter transformer that learns to simulate a programmable bash filesystem from scratch. No real data — every training session is synthetically generated. The model tracks filesystem state across commands by reading and writing compact per-directory state pages as tokens.
 
 ## Quick start
 
@@ -12,50 +12,32 @@ pip install torch                          # PyTorch with CUDA
 # Try the reference simulator (no GPU needed, perfect execution)
 python nullroot_sim.py --demo unix
 
-# Try the neural network (requires CUDA GPU, checkpoint auto-detected)
+# Try the neural network (requires CUDA GPU)
 python sample.py --demo unix
 
 # Verify the data pipeline
 python verify_state.py
 
-# Train from scratch
-python curriculum.py --min-ops 40 --target-ops 77
+# Train from scratch (single stage, all commands at once)
+python curriculum.py --min-ops 20 --target-ops 50
 ```
 
 ## How it works
 
-Each command cycle:
+**Paged context:** each directory is its own state page. The model only sees the current directory — never the whole filesystem. `cd` swaps pages. State size is bounded by a single directory, not total filesystem complexity.
+
+**State patches:** the model outputs a response AND a minimal diff to update the current page. `mkdir foo` produces a patch adding `foo/` to children. `echo hello > file.txt` produces a patch with the file content. Read-only commands (`ls`, `cat`) produce `<nop>`.
+
+**Static registers:** 32 learned vectors prepended to every input, processed through all layers alongside real tokens, then stripped at output. A fixed scratchpad for reasoning at 0.08% parameter cost.
 
 ```
-Input:  [state tokens] <prompt>command<eoi>
-Output: <output>response<eor> <state>patch<eor>
+Input:  <state>@/home/alice#$?=0#children:docs/ readme.txt#readme.txt>hello<eor>
+        <prompt>cat readme.txt<eoi>
+
+Output: <output>hello<eor><nop>
 ```
 
-1. The model reads the current state (filesystem + variables, serialized as tokens)
-2. Processes the command using standard causal self-attention
-3. Produces the correct bash response
-4. Produces a **state patch** — only the parts of the state that changed
-
-The patch is applied to produce the state for the next command. The model never sees old commands — only the current state + current command. State grows with complexity, not command history.
-
-## Try it
-
-### Reference simulator (Python — perfect execution)
-
-```bash
-python nullroot_sim.py                    # bare shell
-python nullroot_sim.py --demo unix        # pre-built Unix filesystem
-python nullroot_sim.py --demo project     # project directory
-python nullroot_sim.py --demo scripting   # variables, math, scripts
-```
-
-### Neural network version (requires CUDA GPU)
-
-```bash
-python sample.py                  # interactive shell
-python sample.py --demo unix      # pre-built filesystem
-python sample.py --demo project   # project directory
-```
+All commands trained simultaneously in a single stage — no curriculum. 15/15 gate tests passed at step 25K. 65/70 on extended tests (93%).
 
 ## Supported commands
 
@@ -64,7 +46,7 @@ python sample.py --demo project   # project directory
 | Command | Example | What it does |
 |---------|---------|-------------|
 | `mkdir` | `mkdir foo` | Create directory |
-| `cd` | `cd foo`, `cd ..`, `cd /path` | Change directory |
+| `cd` | `cd foo`, `cd ..`, `cd /path` | Change directory (page swap) |
 | `ls` | `ls` | List current directory |
 | `pwd` | `pwd` | Print working directory |
 | `touch` | `touch file.txt` | Create empty file |
@@ -76,7 +58,6 @@ python sample.py --demo project   # project directory
 | `mv` | `mv old.txt new.txt` | Move/rename file |
 | `head` | `head file.txt` | First line of file |
 | `wc` | `wc file.txt` | Line/word/char count |
-| `find` | `find .` | List all files recursively |
 | `grep` | `grep pattern file.txt` | Search file contents |
 
 ### Programming
@@ -87,24 +68,20 @@ python sample.py --demo project   # project directory
 | `echo $x` | `echo $x` | Read variable |
 | `export` | `export name=val` | Set variable |
 | `expr` | `expr 3 + 5` | Integer math (+, -, *) |
-| `sh` | `sh script.sh` | Execute script file |
-| `test` | `test -f file.txt` | Test conditions (-f, -d, =, !=) |
 
-## State format
+## Page format
 
-The state is serialized compactly:
+Each directory is a separate page:
 
 ```
-@/home/alice#$?=0#$x=42#/:etc home#/home:alice#/home/alice:notes.txt#/home/alice/notes.txt>hello world
+$?=0#$x=42#children:docs/ readme.txt#readme.txt>hello world
 ```
 
-- `@path` = current working directory
-- `$key=value` = variables (including `$?` for exit status)
-- `#` = entry separator
-- `path:children` = directory with its contents
-- `path>content` = file with its content (newlines escaped as `\n`)
+- `$key=value` = variables (global, prepended to every page)
+- `children:NAME NAME` = directory contents (dirs end with `/`)
+- `NAME>CONTENT` = file content (newlines escaped as `\n`)
 
-After `mkdir foo`, the patch is just `/:foo#/foo:` — only the changed entries. After `cd foo`, just `@/foo`. After `x=5`, just `$x=5`. Read-only commands (`ls`, `cat`, `expr`) produce `<nop>`.
+Pages are cached by Python — `cd ..` restores the parent page, no model regeneration needed.
 
 ## Architecture
 
@@ -115,101 +92,89 @@ After `mkdir foo`, the patch is just `/:foo#/foo:` — only the changed entries.
 | Layers | 6 |
 | Heads | 8 |
 | FFN | SwiGLU, 1536 intermediate |
-| Position encoding | RoPE (theta=500K, supports 131K) |
+| Registers | 32 static prefix (16K params) |
+| Position encoding | RoPE (theta=500K), registers excluded |
 | Attention | Flash (PyTorch SDPA) |
-| Vocab | 96 tokens (19 commands + 10 control flow + a-z + 0-9 + punctuation + special) |
+| Vocab | 96 tokens |
 | Precision | bf16 |
 | Hardware | Single RTX 3090 24GB |
 
 ## Training
 
-All training data is generated on the fly — no datasets, no disk I/O. The simulator tracks full state and produces ground-truth responses and state patches.
+All commands trained simultaneously in a single stage. No curriculum — the model learns filesystem ops, variables, and math all at once. Training data generated on the fly from a reference simulator.
 
 ```bash
-# Phase 3: full programmable system (current)
-python curriculum.py --min-ops 40 --target-ops 77
-
-# Monitor training
-python dashboard.py   # http://localhost:5000
+python curriculum.py --min-ops 20 --target-ops 50
 ```
 
 ### Training parameters
 
 | Parameter | Value | Description |
 |-----------|-------|-------------|
-| `--min-ops` | 40 | Minimum commands per training session |
-| `--target-ops` | 77 | Target commands per session (gaussian around this) |
-| `--gate-check-every` | 500 | Steps between gate test evaluations |
+| `--min-ops` | 20 | Minimum commands per training session |
+| `--target-ops` | 50 | Target commands per session |
+| `--gate-check-every` | 500 | Steps between gate evaluations |
 | Learning rate | 3e-4 → 3e-5 | Cosine decay with 100-step warmup |
 | Optimizer | AdamW | betas=(0.9, 0.95), weight_decay=0.1 |
 | Grad clip | 1.0 | Max gradient norm |
-| Data workers | 4 | Background session generation threads |
-| Seed | 42 | Base random seed for reproducibility |
+| Data workers | 4 | Background generation threads |
+| Seed | 42 | Base random seed |
 
-### Reproducing training
+### Reproducing
 
 ```bash
-# Install dependencies
-pip install torch  # tested with PyTorch 2.x, CUDA
+pip install torch
 
-# Verify data generation is correct
+# Verify data pipeline (100 sessions, 8K+ commands, zero errors)
 python verify_state.py
 
-# Start training from scratch
-python curriculum.py --min-ops 40 --target-ops 77
+# Train from scratch
+python curriculum.py --min-ops 20 --target-ops 50
 
-# Resume from checkpoint after crash
-python curriculum.py --min-ops 40 --target-ops 77 \
-    --resume-ckpt checkpoints/latest.pt --resume-stage 0
+# Resume after crash
+python curriculum.py --min-ops 20 --target-ops 50 \
+    --resume-ckpt checkpoints/latest.pt
 ```
 
 ### Gate tests
 
-Training runs until **all** gate tests pass (13 meaningful tests covering every command type). A `latest.pt` checkpoint is saved at every gate evaluation for crash recovery. Gate tests include:
+Training runs until all 15 gate tests pass: mkdir, cd, ls, pwd, echo, cat, append, rm, cp, mv, head, wc, variables, math (addition + multiplication), and deep navigation (3 levels). Checkpoint saved at every evaluation.
 
-- Directory creation, navigation, listing
-- File creation, writing, reading, appending
-- Copy, move, remove
-- Head, word count
-- Variable assignment and expansion
-- Integer arithmetic
-- Script execution
+## Results
+
+**v4 (paged context + registers): 15/15 gates at step 25K. 65/70 extended tests (93%).**
+
+| Category | Status |
+|----------|--------|
+| Filesystem (mkdir, cd, ls, pwd, rm) | Perfect |
+| Files (echo, cat, head, append) | Perfect |
+| Copy, move | Perfect |
+| Variables (set, expand) | Perfect |
+| Math (expr +, -, *) | 4/5 |
+| Deep navigation (3 levels, cd ..) | Perfect |
+| Cross-directory isolation | Perfect |
+| Grep | Working |
+| Word count | Approximate |
 
 ## Files
 
 | File | What it does |
 |------|-------------|
-| `tokenizer.py` | 96-token vocabulary, encode/decode |
-| `generator.py` | Filesystem + shell simulator with state serialization and patching |
-| `dataset.py` | PyTorch dataset, background threads, state-patch training samples |
-| `model.py` | Transformer (RoPE, SwiGLU, flash attention, gradient checkpointing) |
-| `curriculum.py` | Training loop with gate tests and checkpointing |
-| `sample.py` | Neural network interactive shell with demos |
-| `nullroot_sim.py` | Reference simulator (Python) with demos |
-| `verify_state.py` | Verifies state-patch system correctness (100 sessions, 8K+ commands) |
-| `dashboard.py` | Live training dashboard with charts |
-| `sweep.py` | Architecture sweep testing |
-
-## Status
-
-**Phase 3: 47/53 tests passing (89%).** 21 command types trained simultaneously at step 14K. Results:
-
-| Category | Status | Details |
-|----------|--------|---------|
-| Filesystem | **Perfect** | mkdir, cd, ls, pwd, touch, rm, cp, mv — all correct |
-| Files | **Perfect** | echo >, echo >>, cat, head — including multiline content |
-| Variables | **Perfect** | `x=42` then `echo $x` → `42` |
-| Scripts | **Working** | `echo echo hello > test.sh` then `sh test.sh` → `hello` |
-| Absolute paths | **Working** | `cat /path/to/file`, `cd /deep/path` |
-| Deep navigation | **Mostly** | 3+ levels deep occasionally garbles paths |
-| Math | **Learning** | Outputs numbers but wrong — pattern error, needs more training |
-| find | **Partial** | Complex recursive output still garbled |
-
-**Phase 2 complete.** State-patch architecture proven on filesystem-only task (13/13, step 37K).
+| `tokenizer.py` | 96-token vocabulary |
+| `paged_fs.py` | Paged filesystem with page table and state patches |
+| `generator.py` | Core filesystem + shell simulator |
+| `dataset.py` | Training data generation with paged context |
+| `model.py` | Transformer with static prefix registers |
+| `curriculum.py` | Training loop with gate tests |
+| `sample.py` | Interactive shell (auto-detects checkpoint) |
+| `nullroot_sim.py` | Reference simulator with demos |
+| `verify_state.py` | Data pipeline verification |
+| `visualize.py` | UMAP visualizations of model internals |
+| `dashboard.py` | Live training dashboard |
 
 ## The state-patch pattern
 
-The core idea behind NullRoot generalizes beyond bash:
+The core idea generalizes beyond bash:
 
 ```
 State:  [structured representation of current world]
@@ -217,9 +182,10 @@ Input:  [action or event]
 Output: [response] + [minimal state diff]
 ```
 
-The model learns to **read structured state, process actions, and produce minimal updates**. The state format and domain can be anything — filesystem, game world, database, API session. The key properties:
+The model learns to read structured state, process actions, and produce minimal updates. The state format and domain can be anything. Key properties:
 
 - **State scales with complexity, not history** — mkdir+rm 100 times = small state
-- **Patches are minimal** — only changed entries, not full rewrites
-- **Fully in token space** — no special memory modules, just a transformer reading and writing tokens
-- **Verified deterministic** — reference simulator proves correctness before training
+- **Paged context** — only load what's relevant, not the whole world
+- **Patches are minimal** — only changed entries
+- **Fully in token space** — no special memory modules, just a transformer
+- **Python manages the page table** — model handles fuzzy reasoning, code handles deterministic state
